@@ -43,7 +43,7 @@
   <h1>Scanned room</h1>
   <p id="status">Loading the room…</p>
   <button id="enter" hidden>Enter VR</button>
-  <p id="keys">Drag to look. W, A, S and D walk. Click a ball or an item to pick it up, click again to let go. N adds an office item. Space throws a ball. M switches between the splat and the mesh. R clears up.</p>
+  <p id="keys">Drag to look. W, A, S and D walk. Click a ball or an item to pick it up. An item then sits on whatever you point at, and a second click leaves it there. N adds an office item. Space throws a ball. M switches between the splat and the mesh. R clears up.</p>
 </div>
 
 <script type="module">
@@ -107,6 +107,7 @@ function buildRoom(root) {
   const ny = Math.ceil((box.max.y - min.y) / cell) + 2;
   const nz = Math.ceil((box.max.z - min.z) / cell) + 2;
   const occ = new Uint8Array(nx * ny * nz);            // bit 1: surface here, bit 2: surface faces up
+  const surfY = new Float32Array(nx * ny * nz);        // for upward-facing cells: the exact height of the surface
   const I = (x, y, z) => (y * nz + z) * nx + x;
   const ix = x => Math.floor((x - min.x) / cell), iy = y => Math.floor((y - min.y) / cell), iz = z => Math.floor((z - min.z) / cell);
 
@@ -130,8 +131,13 @@ function buildRoom(root) {
       const steps = Math.max(1, Math.ceil(Math.max(ab.length(), ac.length(), b.distanceTo(c)) / (cell * 0.5)));
       for (let i = 0; i <= steps; i++) for (let j = 0; j <= steps - i; j++) {
         const u = i / steps, v = j / steps;
-        const X = ix(a.x + ab.x * u + ac.x * v), Y = iy(a.y + ab.y * u + ac.y * v), Z = iz(a.z + ab.z * u + ac.z * v);
-        if (X >= 0 && X < nx && Y >= 0 && Y < ny && Z >= 0 && Z < nz) occ[I(X, Y, Z)] |= flag;
+        const py = a.y + ab.y * u + ac.y * v;
+        const X = ix(a.x + ab.x * u + ac.x * v), Y = iy(py), Z = iz(a.z + ab.z * u + ac.z * v);
+        if (X >= 0 && X < nx && Y >= 0 && Y < ny && Z >= 0 && Z < nz) {
+          const k = I(X, Y, Z);
+          if (up && (!(occ[k] & 2) || py > surfY[k])) surfY[k] = py;
+          occ[k] |= flag;
+        }
       }
     }
   });
@@ -282,6 +288,25 @@ function buildRoom(root) {
       if (y < floorY) return true;
       const X = ix(x), Y = iy(y), Z = iz(z);
       return inGrid(X, Y, Z) && occ[I(X, Y, Z)] !== 0;
+    },
+    supportBelow(x, z, y, reach) {          // height of the nearest flat surface under (x, y, z), looking from `reach` above it
+      const X = ix(x), Z = iz(z);
+      if (X < 0 || X >= nx || Z < 0 || Z >= nz) return floorY;
+      const yStop = Math.max(0, iy(floorY + 0.08));
+      for (let Y = Math.min(ny - 1, iy(y + reach)); Y > yStop; Y--) {
+        const k = I(X, Y, Z);
+        if ((occ[k] & 2) && surfY[k] <= y + reach) return surfY[k];
+      }
+      return floorY;
+    },
+    raycast(origin, dir, maxDist) {         // distance along a line of sight to the first scanned surface, or -1
+      for (let t = 0.1; t < maxDist; t += 0.02) {
+        const x = origin.x + dir.x * t, y = origin.y + dir.y * t, z = origin.z + dir.z * t;
+        if (y < floorY) return t;
+        const X = ix(x), Y = iy(y), Z = iz(z);
+        if (inGrid(X, Y, Z) && occ[I(X, Y, Z)] !== 0) return t;
+      }
+      return -1;
     },
     canStand(x, z) { const X = ix(x), Z = iz(z); return X >= 0 && X < nx && Z >= 0 && Z < nz && walk[J(X, Z)] === 1; },
     headInRoom(x, z) { const X = ix(x), Z = iz(z); return !(X >= 0 && X < nx && Z >= 0 && Z < nz) ? false : headOK[J(X, Z)] === 1; },
@@ -478,6 +503,11 @@ function resetItems() {                     // balls go back to the desk, added 
     it.mesh.position.copy(it.home); it.vel.set(0, 0, 0); it.moving = false; it.quiet = 0;
   }
 }
+function supportUnder(it, x, z, y, reach) { // highest surface under the item's footprint, so edges and small gaps in the scan still hold it
+  const d = it.r * 0.6;
+  return Math.max(room.supportBelow(x, z, y, reach), room.supportBelow(x + d, z, y, reach), room.supportBelow(x - d, z, y, reach),
+                  room.supportBelow(x, z + d, y, reach), room.supportBelow(x, z - d, y, reach));
+}
 function releaseItem(it, velocity) {        // let go: balls bounce, office items settle upright where they land
   scene.attach(it.mesh);
   it.heldBy = null; it.hovering = false;
@@ -486,9 +516,11 @@ function releaseItem(it, velocity) {        // let go: balls bounce, office item
     it.vel.multiplyScalar(0.6);
     const e = new THREE.Euler().setFromQuaternion(it.mesh.quaternion, 'YXZ');
     it.upright = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
-    const p = it.mesh.position;
-    for (let k = 0; k < 40 && room.solid(p.x, p.y + 0.02, p.z); k++) p.y += 0.01;     // not left half inside a surface
   }
+  /* If it was let go a little below a surface (easy to do when there is nothing solid to feel), lift it onto that surface. */
+  const p = it.mesh.position, base = it.kind === 'ball' ? p.y - it.r : p.y;
+  const top = supportUnder(it, p.x, p.z, base, 0.15);
+  if (base < top) p.y += top - base;
 }
 function updateItems(dt) {
   for (const it of items) {
@@ -507,9 +539,10 @@ function updateItems(dt) {
         p.z += v.z * h;
         if (room.solid(p.x, p.y, p.z + Math.sign(v.z) * r)) { p.z -= v.z * h; v.z *= -0.55; }
         p.y += v.y * h;
-        if (room.solid(p.x, p.y + Math.sign(v.y) * r, p.z)) {
+        const top = v.y < 0 ? supportUnder(it, p.x, p.z, p.y - r, 0.03) : -Infinity;
+        if (p.y - r < top || room.solid(p.x, p.y + Math.sign(v.y) * r, p.z)) {
           p.y -= v.y * h;
-          if (v.y < 0) { grounded = true; v.x *= 0.9; v.z *= 0.9; }
+          if (v.y < 0) { grounded = true; v.x *= 0.9; v.z *= 0.9; if (p.y - r < top) p.y = top + r; }
           v.y *= -0.5;
           if (Math.abs(v.y) < 0.35) v.y = 0;
         }
@@ -522,7 +555,10 @@ function updateItems(dt) {
         p.z += v.z * h;
         if (room.solid(p.x, p.y + mid, p.z + Math.sign(v.z) * it.r)) { p.z -= v.z * h; v.z = 0; }
         p.y += v.y * h;
-        if (v.y < 0 && room.solid(p.x, p.y, p.z)) { p.y -= v.y * h; v.y = 0; grounded = true; v.x *= 0.5; v.z *= 0.5; }
+        if (v.y <= 0) {
+          const top = supportUnder(it, p.x, p.z, p.y, 0.04);
+          if (p.y <= top) { p.y = top; v.y = 0; grounded = true; v.x *= 0.5; v.z *= 0.5; }
+        }
       }
     }
     if (grounded && v.lengthSq() < 0.01) { it.quiet += dt; if (it.quiet > 0.3) { it.moving = false; v.set(0, 0, 0); } } else it.quiet = 0;
@@ -718,6 +754,7 @@ renderer.domElement.addEventListener('pointerup', e => {
   if (Math.hypot(e.clientX - pointerStart.x, e.clientY - pointerStart.y) < 6) clickAt(e.clientX, e.clientY);   // a click, not a drag
 });
 renderer.domElement.addEventListener('pointermove', e => {
+  ndc.set(e.clientX / window.innerWidth * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
   if (!dragging || renderer.xr.isPresenting) return;
   yaw -= e.movementX * 0.004; pitch = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * 0.004));
 });
@@ -742,8 +779,8 @@ function mouseDrop() {
   releaseItem(it, it.kind === 'ball' ? f.multiplyScalar(4.5).add(tmpB.set(0, 1.2, 0)) : f.set(0, 0, 0));
 }
 function clickAt(x, y) {
-  if (mouseHand.held) { mouseDrop(); return; }
   ndc.set(x / window.innerWidth * 2 - 1, -(y / window.innerHeight) * 2 + 1);
+  if (mouseHand.held) { mouseDrop(); return; }
   rig.updateMatrixWorld(true); camera.updateMatrixWorld(true);
   picker.setFromCamera(ndc, camera);
   let best = null, bestT = Infinity;
@@ -773,12 +810,23 @@ function updateDesktop(dt) {
     tryMove((f.x * fwd - f.z * side) * step, (f.z * fwd + f.x * side) * step);
   }
   const it = mouseHand.held;
-  if (it) {                                 // carry it a little in front of the view
-    rig.updateMatrixWorld(true);
-    const m = it.mesh, f = viewDirection(tmpA);
-    headPosition(m.position).addScaledVector(f, 0.6);
-    m.position.y -= it.kind === 'ball' ? 0.1 : 0.1 + it.h * 0.5;
-    if (it.kind === 'prop') m.rotation.set(0, yaw, 0);
+  if (it) {
+    rig.updateMatrixWorld(true); camera.updateMatrixWorld(true);
+    const m = it.mesh;
+    if (it.kind === 'prop') {               // an office item sits on whatever the pointer is over, so you see where it will go
+      picker.setFromCamera(ndc, camera);
+      const o = picker.ray.origin, d = picker.ray.direction, t = room.raycast(o, d, 3);
+      if (t > 0) {
+        const back = Math.max(0.1, t - 0.06);
+        const x = o.x + d.x * back, z = o.z + d.z * back, y = o.y + d.y * back;
+        m.position.set(x, supportUnder(it, x, z, y, 0.1), z);
+      } else {
+        m.position.copy(o).addScaledVector(d, 0.6); m.position.y -= it.h * 0.5;
+      }
+      m.rotation.set(0, yaw, 0);
+    } else {                                // a ball is carried in front of the view, ready to throw
+      headPosition(m.position).addScaledVector(viewDirection(tmpA), 0.6); m.position.y -= 0.1;
+    }
   }
 }
 
@@ -896,7 +944,7 @@ renderer.setAnimationLoop(() => {
   }
 })();
 
-window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, items, balls: items, hands, renderer, scene, toggleView, resetItems, resetBalls: resetItems, spawnItem, clickAt, mouseHand, CATALOG, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
+window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, items, balls: items, hands, renderer, scene, toggleView, resetItems, resetBalls: resetItems, spawnItem, releaseItem, supportUnder, clickAt, mouseHand, CATALOG, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
 </script>
 </body>
 </html>

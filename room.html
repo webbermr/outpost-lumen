@@ -43,7 +43,7 @@
   <h1>Scanned room</h1>
   <p id="status">Loading the room…</p>
   <button id="enter" hidden>Enter VR</button>
-  <p id="keys">Drag to look. W, A, S and D walk. M switches between the splat and the mesh. Space throws a ball.</p>
+  <p id="keys">Drag to look. W, A, S and D walk. Click a ball or an item to pick it up, click again to let go. N adds an office item. Space throws a ball. M switches between the splat and the mesh. R clears up.</p>
 </div>
 
 <script type="module">
@@ -291,7 +291,6 @@ function buildRoom(root) {
 
 /* ---------- state ---------- */
 let room = null, meshRoot = null, splat = null, splatReady = false, showSplat = true, settleFrames = 0;
-const balls = [];
 const tmpA = new V3(), tmpB = new V3(), tmpC = new V3(), tmpQ = new THREE.Quaternion();
 
 function applyView() {
@@ -301,48 +300,236 @@ function applyView() {
 }
 function toggleView() { showSplat = !showSplat; applyView(); }
 
-/* ---------- balls ---------- */
+/* ---------- things you can pick up: balls and office items ---------- */
 const BALL_COLORS = [0xff5a4f, 0xffc93c, 0x3ccf91, 0x4aa8ff, 0xc77dff];
+const items = [];
+function addItem(mesh, opts) {
+  scene.add(mesh);
+  const it = Object.assign({ mesh, home: mesh.position.clone(), vel: new V3(), moving: false, heldBy: null, quiet: 0,
+    kind: 'ball', r: CONFIG.ballRadius, h: CONFIG.ballRadius * 2, pick: 0.1, spawned: false, hovering: false, upright: null }, opts);
+  items.push(it);
+  return it;
+}
 function makeBalls() {
   const geo = new THREE.IcosahedronGeometry(CONFIG.ballRadius, 2);
   room.spots.forEach((spot, i) => {
     const color = BALL_COLORS[i % BALL_COLORS.length];
     const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, roughness: 0.45, emissive: color, emissiveIntensity: 0.25 }));
     mesh.position.copy(spot.pos);
-    scene.add(mesh);
-    balls.push({ mesh, home: spot.pos.clone(), vel: new V3(), moving: false, heldBy: null, quiet: 0 });
+    addItem(mesh, {});
   });
 }
-function resetBalls() {
-  for (const b of balls) {
-    if (b.heldBy) { b.heldBy.held = null; b.heldBy = null; scene.attach(b.mesh); }
-    b.mesh.position.copy(b.home); b.vel.set(0, 0, 0); b.moving = false; b.quiet = 0;
+function itemCenter(it, out) {              // balls are centred on their origin; office items sit on theirs
+  if (it.kind === 'ball') return it.mesh.getWorldPosition(out);
+  return it.mesh.localToWorld(out.set(0, it.h * 0.5, 0));
+}
+
+/* ----- office items, built from simple shapes at real-world size (origin at the base, front facing +Z) ----- */
+const M = (color, rough = 0.6, metal = 0) => new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
+const box = (w, h, d, mat) => new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+const cyl = (rt, rb, h, mat, seg = 20) => new THREE.Mesh(new THREE.CylinderGeometry(rt, rb, h, seg), mat);
+function rod(a, b, r, mat) {                // a thin cylinder between two points
+  const m = cyl(r, r, a.distanceTo(b), mat, 10);
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(new V3(0, 1, 0), b.clone().sub(a).normalize());
+  return m;
+}
+function screenTexture(kind) {
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 320;
+  const g = cv.getContext('2d');
+  const bg = g.createLinearGradient(0, 0, 512, 320);
+  bg.addColorStop(0, '#1d3557'); bg.addColorStop(1, '#3a6ea5');
+  g.fillStyle = bg; g.fillRect(0, 0, 512, 320);
+  if (kind === 'chart') {
+    g.fillStyle = '#f4f1de'; g.fillRect(36, 30, 440, 250);
+    const bars = [90, 140, 110, 180, 150, 205];
+    bars.forEach((v, i) => { g.fillStyle = ['#e07a5f', '#3d405b', '#81b29a'][i % 3]; g.fillRect(70 + i * 64, 250 - v, 40, v); });
+    g.fillStyle = '#3d405b'; g.fillRect(60, 250, 400, 3);
+  } else {
+    g.fillStyle = '#f4f1de'; g.fillRect(40, 36, 250, 170);
+    g.fillStyle = '#3d405b'; g.fillRect(40, 36, 250, 22);
+    g.fillStyle = '#9aa5b1'; for (let i = 0; i < 6; i++) g.fillRect(56, 76 + i * 20, 120 + (i * 37) % 90, 8);
+    g.fillStyle = '#e9edc9'; g.fillRect(250, 120, 220, 150);
+    g.fillStyle = '#588157'; g.fillRect(250, 120, 220, 22);
+    g.fillStyle = '#14213d'; g.fillRect(0, 296, 512, 24);
+  }
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function keyTexture() {
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 160;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#26272b'; g.fillRect(0, 0, 512, 160);
+  g.fillStyle = '#4a4c53';
+  for (let r = 0; r < 5; r++) for (let c = 0; c < 15; c++) {
+    if (r === 4 && c > 3 && c < 10) continue;
+    g.fillRect(10 + c * 33 + (r % 2) * 6, 10 + r * 29, 27, 23);
+  }
+  g.fillRect(10 + 4 * 33, 10 + 4 * 29, 6 * 33 - 6, 23);          // space bar
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const CATALOG = [
+  function laptop() {
+    const g = new THREE.Group(), silver = M(0xb9bcc2, 0.45, 0.6), dark = M(0x2b2d33, 0.7);
+    const base = box(0.32, 0.016, 0.22, silver); base.position.y = 0.008; g.add(base);
+    const keys = new THREE.Mesh(new THREE.PlaneGeometry(0.28, 0.1), new THREE.MeshStandardMaterial({ map: keyTexture(), roughness: 0.8 }));
+    keys.rotation.x = -Math.PI / 2; keys.position.set(0, 0.0165, -0.035); g.add(keys);
+    const pad = box(0.1, 0.001, 0.06, dark); pad.position.set(0, 0.0165, 0.065); g.add(pad);
+    const lid = new THREE.Group(); lid.position.set(0, 0.016, -0.108); lid.rotation.x = -0.3;
+    const shell = box(0.32, 0.21, 0.008, silver); shell.position.y = 0.105; lid.add(shell);
+    const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.3, 0.19), new THREE.MeshBasicMaterial({ map: screenTexture('desktop') }));
+    screen.position.set(0, 0.105, 0.0045); lid.add(screen);
+    g.add(lid);
+    return { group: g, h: 0.22, r: 0.1, pick: 0.2 };
+  },
+  function mug() {
+    const g = new THREE.Group(), china = M(0xe63946, 0.35);
+    const body = cyl(0.04, 0.036, 0.09, china); body.position.y = 0.045; g.add(body);
+    const coffee = new THREE.Mesh(new THREE.CircleGeometry(0.035, 20), M(0x3b2314, 0.3));
+    coffee.rotation.x = -Math.PI / 2; coffee.position.y = 0.0905; g.add(coffee);
+    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.026, 0.007, 8, 16, Math.PI), china);
+    handle.position.set(0.038, 0.047, 0); handle.rotation.z = -Math.PI / 2; g.add(handle);
+    return { group: g, h: 0.09, r: 0.04, pick: 0.1 };
+  },
+  function monitor() {
+    const g = new THREE.Group(), dark = M(0x1f2126, 0.6, 0.2);
+    const foot = cyl(0.1, 0.11, 0.012, dark, 24); foot.position.y = 0.006; g.add(foot);
+    const neck = box(0.035, 0.26, 0.03, dark); neck.position.set(0, 0.14, -0.02); g.add(neck);
+    const panel = box(0.56, 0.33, 0.022, dark); panel.position.set(0, 0.3, 0); g.add(panel);
+    const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.54, 0.31), new THREE.MeshBasicMaterial({ map: screenTexture('chart') }));
+    screen.position.set(0, 0.3, 0.0115); g.add(screen);
+    return { group: g, h: 0.47, r: 0.11, pick: 0.3 };
+  },
+  function keyboard() {
+    const g = new THREE.Group();
+    const body = box(0.43, 0.018, 0.135, M(0x1f2126, 0.7)); body.position.y = 0.009; g.add(body);
+    const top = new THREE.Mesh(new THREE.PlaneGeometry(0.42, 0.125), new THREE.MeshStandardMaterial({ map: keyTexture(), roughness: 0.8 }));
+    top.rotation.x = -Math.PI / 2; top.position.y = 0.0185; g.add(top);
+    return { group: g, h: 0.02, r: 0.07, pick: 0.2 };
+  },
+  function mouse() {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 12), M(0xdfe3e8, 0.4));
+    body.scale.set(0.031, 0.018, 0.052); body.position.y = 0.018; g.add(body);
+    const wheel = cyl(0.006, 0.006, 0.006, M(0x2b2d33), 10); wheel.rotation.z = Math.PI / 2; wheel.position.set(0, 0.033, -0.02); g.add(wheel);
+    return { group: g, h: 0.036, r: 0.03, pick: 0.09 };
+  },
+  function lamp() {
+    const g = new THREE.Group(), steel = M(0x30343b, 0.4, 0.7);
+    const foot = cyl(0.07, 0.075, 0.015, steel, 24); foot.position.y = 0.0075; g.add(foot);
+    const a = new V3(0, 0.015, 0), b = new V3(0, 0.27, -0.12), c = new V3(0, 0.39, 0.09);
+    g.add(rod(a, b, 0.008, steel), rod(b, c, 0.008, steel));
+    const joint = new THREE.Mesh(new THREE.SphereGeometry(0.014, 12, 8), steel); joint.position.copy(b); g.add(joint);
+    const shade = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.09, 20, 1, true), new THREE.MeshStandardMaterial({ color: 0xf2a65a, roughness: 0.5, side: THREE.DoubleSide }));
+    shade.position.set(0, 0.36, 0.11); shade.rotation.x = 0.35; g.add(shade);
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.022, 12, 8), new THREE.MeshBasicMaterial({ color: 0xfff1c9 }));
+    bulb.position.set(0, 0.335, 0.118); g.add(bulb);
+    return { group: g, h: 0.42, r: 0.07, pick: 0.22 };
+  },
+  function plant() {
+    const g = new THREE.Group();
+    const pot = cyl(0.06, 0.045, 0.1, M(0xc8553d, 0.8), 14); pot.position.y = 0.05; g.add(pot);
+    const soil = new THREE.Mesh(new THREE.CircleGeometry(0.055, 14), M(0x3b2a1e, 1)); soil.rotation.x = -Math.PI / 2; soil.position.y = 0.097; g.add(soil);
+    const leafGeo = new THREE.SphereGeometry(1, 10, 8);
+    for (let i = 0; i < 9; i++) {
+      const stem = new THREE.Group(); stem.position.y = 0.095; stem.rotation.y = i * 2.4;
+      const leaf = new THREE.Mesh(leafGeo, M(i % 2 ? 0x2d6a4f : 0x40916c, 0.7));
+      const len = 0.09 + (i % 3) * 0.025, tilt = 0.25 + (i % 4) * 0.2;
+      leaf.scale.set(0.022, len, 0.008); leaf.position.set(Math.sin(tilt) * len, Math.cos(tilt) * len, 0); leaf.rotation.z = -tilt;
+      stem.add(leaf); g.add(stem);
+    }
+    return { group: g, h: 0.32, r: 0.06, pick: 0.2 };
+  },
+  function books() {
+    const g = new THREE.Group();
+    const spec = [[0.21, 0.035, 0.15, 0x9d0208, 0.06], [0.2, 0.03, 0.14, 0x1d3557, -0.14], [0.185, 0.026, 0.13, 0xe9c46a, 0.2]];
+    let y = 0;
+    for (const [w, h, d, color, turn] of spec) {
+      const cover = box(w, h, d, M(color, 0.8)); cover.position.y = y + h / 2; cover.rotation.y = turn; g.add(cover);
+      const pages = box(w - 0.012, h - 0.008, d - 0.004, M(0xf4f1de, 0.9)); pages.position.set(0.004, y + h / 2, 0); pages.rotation.y = turn; pages.scale.z = 1.02; g.add(pages);
+      y += h;
+    }
+    return { group: g, h: 0.091, r: 0.08, pick: 0.17 };
+  }
+];
+let nextKind = 0;
+function spawnItem() {                      // a new office item appears floating in front of you
+  for (const it of items) if (it.hovering) { it.hovering = false; it.moving = true; it.quiet = 0; }   // let the previous one drop
+  const built = CATALOG[nextKind++ % CATALOG.length]();
+  rig.updateMatrixWorld(true);
+  const head = headPosition(tmpA).clone(), f = headForward(tmpB);
+  built.group.position.set(head.x + f.x * 0.5, Math.max(room.floorY + 0.3, head.y - 0.4), head.z + f.z * 0.5);
+  built.group.rotation.y = Math.atan2(-f.x, -f.z);
+  const it = addItem(built.group, { kind: 'prop', r: built.r, h: built.h, pick: built.pick, spawned: true, hovering: true });
+  const mine = items.filter(i => i.spawned);
+  if (mine.length > 20) removeItem(mine[0]);
+  return it;
+}
+function removeItem(it) {
+  if (it.heldBy) { it.heldBy.held = null; it.heldBy = null; }
+  it.mesh.removeFromParent();
+  const k = items.indexOf(it); if (k >= 0) items.splice(k, 1);
+}
+function resetItems() {                     // balls go back to the desk, added office items are cleared away
+  for (const it of items.slice()) {
+    if (it.spawned) { removeItem(it); continue; }
+    if (it.heldBy) { it.heldBy.held = null; it.heldBy = null; scene.attach(it.mesh); }
+    it.mesh.position.copy(it.home); it.vel.set(0, 0, 0); it.moving = false; it.quiet = 0;
   }
 }
-function updateBalls(dt) {
-  const r = CONFIG.ballRadius;
-  for (const b of balls) {
-    if (b.heldBy || !b.moving) continue;
-    const p = b.mesh.position, v = b.vel;
+function releaseItem(it, velocity) {        // let go: balls bounce, office items settle upright where they land
+  scene.attach(it.mesh);
+  it.heldBy = null; it.hovering = false;
+  it.vel.copy(velocity); it.moving = true; it.quiet = 0;
+  if (it.kind === 'prop') {
+    it.vel.multiplyScalar(0.6);
+    const e = new THREE.Euler().setFromQuaternion(it.mesh.quaternion, 'YXZ');
+    it.upright = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, e.y, 0));
+    const p = it.mesh.position;
+    for (let k = 0; k < 40 && room.solid(p.x, p.y + 0.02, p.z); k++) p.y += 0.01;     // not left half inside a surface
+  }
+}
+function updateItems(dt) {
+  for (const it of items) {
+    if (it.heldBy) continue;
+    const p = it.mesh.position, v = it.vel;
+    if (it.kind === 'prop' && it.upright && it.mesh.quaternion.angleTo(it.upright) > 0.002) it.mesh.quaternion.slerp(it.upright, Math.min(1, dt * 10));
+    if (!it.moving) continue;
     v.y -= 9.8 * dt;
-    const n = Math.min(12, Math.max(1, Math.ceil(v.length() * dt / 0.02)));
-    const h = dt / n;
+    const n = Math.min(12, Math.max(1, Math.ceil(v.length() * dt / 0.02))), h = dt / n;
     let grounded = false;
-    for (let s = 0; s < n; s++) {
-      p.x += v.x * h;
-      if (room.solid(p.x + Math.sign(v.x) * r, p.y, p.z)) { p.x -= v.x * h; v.x *= -0.55; }
-      p.z += v.z * h;
-      if (room.solid(p.x, p.y, p.z + Math.sign(v.z) * r)) { p.z -= v.z * h; v.z *= -0.55; }
-      p.y += v.y * h;
-      if (room.solid(p.x, p.y + Math.sign(v.y) * r, p.z)) {
-        p.y -= v.y * h;
-        if (v.y < 0) { grounded = true; v.x *= 0.9; v.z *= 0.9; }
-        v.y *= -0.5;
-        if (Math.abs(v.y) < 0.35) v.y = 0;
+    if (it.kind === 'ball') {
+      const r = it.r;
+      for (let s = 0; s < n; s++) {
+        p.x += v.x * h;
+        if (room.solid(p.x + Math.sign(v.x) * r, p.y, p.z)) { p.x -= v.x * h; v.x *= -0.55; }
+        p.z += v.z * h;
+        if (room.solid(p.x, p.y, p.z + Math.sign(v.z) * r)) { p.z -= v.z * h; v.z *= -0.55; }
+        p.y += v.y * h;
+        if (room.solid(p.x, p.y + Math.sign(v.y) * r, p.z)) {
+          p.y -= v.y * h;
+          if (v.y < 0) { grounded = true; v.x *= 0.9; v.z *= 0.9; }
+          v.y *= -0.5;
+          if (Math.abs(v.y) < 0.35) v.y = 0;
+        }
+      }
+    } else {
+      const mid = Math.min(it.h * 0.5, 0.15) + 0.03;
+      for (let s = 0; s < n; s++) {
+        p.x += v.x * h;
+        if (room.solid(p.x + Math.sign(v.x) * it.r, p.y + mid, p.z)) { p.x -= v.x * h; v.x = 0; }
+        p.z += v.z * h;
+        if (room.solid(p.x, p.y + mid, p.z + Math.sign(v.z) * it.r)) { p.z -= v.z * h; v.z = 0; }
+        p.y += v.y * h;
+        if (v.y < 0 && room.solid(p.x, p.y, p.z)) { p.y -= v.y * h; v.y = 0; grounded = true; v.x *= 0.5; v.z *= 0.5; }
       }
     }
-    if (grounded && v.lengthSq() < 0.01) { b.quiet += dt; if (b.quiet > 0.4) { b.moving = false; v.set(0, 0, 0); } } else b.quiet = 0;
-    if (room.outOfBounds(p)) { p.copy(b.home); v.set(0, 0, 0); b.moving = false; }
+    if (grounded && v.lengthSq() < 0.01) { it.quiet += dt; if (it.quiet > 0.3) { it.moving = false; v.set(0, 0, 0); } } else it.quiet = 0;
+    if (room.outOfBounds(p)) {
+      if (it.spawned) p.set(room.start.x, room.floorY + 0.01, room.start.z); else p.copy(it.home);
+      v.set(0, 0, 0); it.moving = false;
+    }
   }
 }
 
@@ -413,19 +600,19 @@ function endTeleport(go) {
 const hands = { left: null, right: null };
 const controllerModels = new XRControllerModelFactory();
 function makeWristPanel() {
-  const W = 640, H = 400, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const W = 640, H = 460, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
   const g = cv.getContext('2d');
   g.fillStyle = '#14141c'; g.fillRect(0, 0, W, H);
   g.strokeStyle = '#7df9ff'; g.lineWidth = 4; g.strokeRect(6, 6, W - 12, H - 12);
   const font = '"Avenir Next", "Segoe UI", system-ui, sans-serif';
-  const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'], ['Right trigger', 'Teleport'], ['Grip', 'Grab a ball'], ['A', 'Splat or mesh'], ['X', 'Reset balls']];
+  const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'], ['Right trigger', 'Teleport'], ['Grip', 'Pick up, put down'], ['B', 'New office item'], ['A', 'Splat or mesh'], ['X', 'Clear and reset']];
   rows.forEach((row, i) => {
     const y = 66 + i * 58;
     g.font = '600 34px ' + font; g.fillStyle = '#7df9ff'; g.fillText(row[0], 30, y);
     g.font = '34px ' + font; g.fillStyle = '#f1efe9'; g.fillText(row[1], 290, y);
   });
   const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
-  const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.1), new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.115), new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
   panel.position.set(0, 0.1, 0.02); panel.rotation.x = -0.75;      // floats just above the left controller, tilted toward you
   return panel;
 }
@@ -443,7 +630,7 @@ for (let i = 0; i < 2; i++) {
     if (hand.side === 'left') grip.add(wristPanel);
   });
   ray.addEventListener('disconnected', () => {
-    if (hand.held) dropBall(hand, false);
+    if (hand.held) dropItem(hand, false);
     if (hand.side && hands[hand.side] === hand) hands[hand.side] = null;
     hand.gamepad = null; hand.side = null;
   });
@@ -452,29 +639,28 @@ function pad(hand) {
   const gp = hand && hand.gamepad;
   if (!gp) return null;
   const down = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
-  return { trigger: down(0), grip: down(1), primary: down(4), x: gp.axes[2] || 0, y: gp.axes[3] || 0 };
+  return { trigger: down(0), grip: down(1), primary: down(4), secondary: down(5), x: gp.axes[2] || 0, y: gp.axes[3] || 0 };
 }
 function buzz(hand, strength, ms) { try { hand.gamepad.hapticActuators[0].pulse(strength, ms); } catch (e) { /* no haptics */ } }
 
-function grabBall(hand) {
+function grabItem(hand) {
   if (hand.held) return;
   const hp = hand.grip.getWorldPosition(tmpA);
-  let best = null, bestD = 0.22;                       // reach, metres
-  for (const b of balls) {
-    if (b.heldBy) continue;
-    const d = b.mesh.getWorldPosition(tmpB).distanceTo(hp);
-    if (d < bestD) { bestD = d; best = b; }
+  let best = null, bestD = Infinity;
+  for (const it of items) {
+    if (it.heldBy) continue;
+    const d = itemCenter(it, tmpB).distanceTo(hp) - it.pick;      // bigger things can be grabbed from further off
+    if (d < 0.12 && d < bestD) { bestD = d; best = it; }
   }
   if (!best) return;
   hand.grip.attach(best.mesh);
-  best.heldBy = hand; best.moving = false; hand.held = best;
+  best.heldBy = hand; best.moving = false; best.hovering = false; hand.held = best;
   buzz(hand, 0.6, 40);
 }
-function dropBall(hand, thrown) {
-  const b = hand.held; if (!b) return;
-  scene.attach(b.mesh);
-  b.heldBy = null; hand.held = null;
-  b.vel.copy(thrown ? hand.vel : tmpA.set(0, 0, 0)); b.moving = true; b.quiet = 0;
+function dropItem(hand, thrown) {
+  const it = hand.held; if (!it) return;
+  hand.held = null;
+  releaseItem(it, thrown ? hand.vel : tmpA.set(0, 0, 0));
 }
 
 function updateVR(dt) {
@@ -494,17 +680,18 @@ function updateVR(dt) {
       const f = headForward(tmpA), step = CONFIG.walkSpeed * dt;
       tryMove((f.x * -lp.y - f.z * lp.x) * step, (f.z * -lp.y + f.x * lp.x) * step);
     }
-    if (lp.grip && !L.was.grip) grabBall(L);
-    if (!lp.grip && L.was.grip) dropBall(L, true);
-    if (lp.primary && !L.was.primary) resetBalls();
+    if (lp.grip && !L.was.grip) grabItem(L);
+    if (!lp.grip && L.was.grip) dropItem(L, true);
+    if (lp.primary && !L.was.primary) resetItems();
     L.was = lp;
   }
   if (rp) {
     if (Math.abs(rp.x) < 0.3) R.turnLatch = false;
     else if (!R.turnLatch && Math.abs(rp.x) > 0.7) { R.turnLatch = true; snapTurn((rp.x > 0 ? -1 : 1) * Math.PI / 6); }
-    if (rp.grip && !R.was.grip) grabBall(R);
-    if (!rp.grip && R.was.grip) dropBall(R, true);
+    if (rp.grip && !R.was.grip) grabItem(R);
+    if (!rp.grip && R.was.grip) dropItem(R, true);
     if (rp.primary && !R.was.primary) toggleView();
+    if (rp.secondary && !R.was.secondary) { spawnItem(); buzz(R, 0.4, 30); }
     if (rp.trigger && !R.was.trigger) teleport.aiming = true;
     if (!rp.trigger && R.was.trigger) endTeleport(true);
     if (teleport.aiming) {
@@ -519,24 +706,58 @@ function updateVR(dt) {
 /* ---------- desktop preview ---------- */
 const keys = new Set();
 let yaw = 0, pitch = 0, dragging = false, nextBall = 0;
-renderer.domElement.addEventListener('pointerdown', e => { dragging = true; renderer.domElement.setPointerCapture(e.pointerId); });
-renderer.domElement.addEventListener('pointerup', () => { dragging = false; });
+const mouseHand = { held: null };            // stands in for a controller when you use the mouse
+const pointerStart = { x: 0, y: 0 }, picker = new THREE.Raycaster(), ndc = new THREE.Vector2();
+renderer.domElement.addEventListener('pointerdown', e => {
+  dragging = true; pointerStart.x = e.clientX; pointerStart.y = e.clientY;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener('pointerup', e => {
+  dragging = false;
+  if (!room || renderer.xr.isPresenting) return;
+  if (Math.hypot(e.clientX - pointerStart.x, e.clientY - pointerStart.y) < 6) clickAt(e.clientX, e.clientY);   // a click, not a drag
+});
 renderer.domElement.addEventListener('pointermove', e => {
   if (!dragging || renderer.xr.isPresenting) return;
   yaw -= e.movementX * 0.004; pitch = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * 0.004));
 });
 window.addEventListener('keydown', e => {
   keys.add(e.code);
-  if (!room || renderer.xr.isPresenting) return;
+  if (!room || renderer.xr.isPresenting || e.repeat) return;
   if (e.code === 'KeyM') toggleView();
-  if (e.code === 'KeyR') resetBalls();
+  if (e.code === 'KeyR') resetItems();
+  if (e.code === 'KeyN') { mouseDrop(); mouseTake(spawnItem()); }
   if (e.code === 'Space') { e.preventDefault(); throwFromCamera(); }
 });
 window.addEventListener('keyup', e => keys.delete(e.code));
+function viewDirection(out) { camera.getWorldQuaternion(tmpQ); return out.set(0, 0, -1).applyQuaternion(tmpQ); }
+function mouseTake(it) {
+  if (!it) return;
+  it.heldBy = mouseHand; it.moving = false; it.hovering = false; mouseHand.held = it;
+}
+function mouseDrop() {
+  const it = mouseHand.held; if (!it) return;
+  mouseHand.held = null;
+  const f = viewDirection(tmpA);
+  releaseItem(it, it.kind === 'ball' ? f.multiplyScalar(4.5).add(tmpB.set(0, 1.2, 0)) : f.set(0, 0, 0));
+}
+function clickAt(x, y) {
+  if (mouseHand.held) { mouseDrop(); return; }
+  ndc.set(x / window.innerWidth * 2 - 1, -(y / window.innerHeight) * 2 + 1);
+  rig.updateMatrixWorld(true); camera.updateMatrixWorld(true);
+  picker.setFromCamera(ndc, camera);
+  let best = null, bestT = Infinity;
+  for (const it of items) {
+    if (it.heldBy) continue;
+    const c = itemCenter(it, tmpB), t = tmpC.copy(c).sub(picker.ray.origin).dot(picker.ray.direction);
+    if (t > 0 && t < 5 && t < bestT && picker.ray.distanceSqToPoint(c) < (it.pick * 0.8) ** 2) { bestT = t; best = it; }
+  }
+  mouseTake(best);
+}
 function throwFromCamera() {
-  const b = balls[nextBall++ % balls.length]; if (!b || b.heldBy) return;
-  camera.getWorldQuaternion(tmpQ);
-  const f = tmpA.set(0, 0, -1).applyQuaternion(tmpQ);
+  const pool = items.filter(i => i.kind === 'ball' && !i.heldBy);
+  const b = pool[nextBall++ % Math.max(1, pool.length)]; if (!b) return;
+  const f = viewDirection(tmpA);
   headPosition(b.mesh.position).addScaledVector(f, 0.3);
   b.vel.copy(f).multiplyScalar(4.5); b.vel.y += 1.2; b.moving = true; b.quiet = 0;
 }
@@ -550,6 +771,14 @@ function updateDesktop(dt) {
     rig.updateMatrixWorld(true);
     const f = headForward(tmpA), step = CONFIG.walkSpeed * dt;
     tryMove((f.x * fwd - f.z * side) * step, (f.z * fwd + f.x * side) * step);
+  }
+  const it = mouseHand.held;
+  if (it) {                                 // carry it a little in front of the view
+    rig.updateMatrixWorld(true);
+    const m = it.mesh, f = viewDirection(tmpA);
+    headPosition(m.position).addScaledVector(f, 0.6);
+    m.position.y -= it.kind === 'ball' ? 0.1 : 0.1 + it.h * 0.5;
+    if (it.kind === 'prop') m.rotation.set(0, yaw, 0);
   }
 }
 
@@ -639,7 +868,7 @@ renderer.setAnimationLoop(() => {
   if (room) {
     const inVR = renderer.xr.isPresenting;
     if (inVR) updateVR(dt); else updateDesktop(dt);
-    updateBalls(dt);
+    updateItems(dt);
     updateFade(dt, inVR);
   }
   renderer.render(scene, camera);
@@ -667,7 +896,7 @@ renderer.setAnimationLoop(() => {
   }
 })();
 
-window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, balls, hands, renderer, scene, toggleView, resetBalls, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
+window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, items, balls: items, hands, renderer, scene, toggleView, resetItems, resetBalls: resetItems, spawnItem, clickAt, mouseHand, CATALOG, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
 </script>
 </body>
 </html>

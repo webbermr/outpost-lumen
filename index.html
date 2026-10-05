@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Outpost Lumen</title>
+<meta name="description" content="A small sci-fi world you can walk around in on a Meta Quest headset.">
+<script src="https://cdn.jsdelivr.net/npm/aframe@1.7.1/dist/aframe-master.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060f; }
+  #hud {
+    position: fixed; z-index: 5; pointer-events: none;
+    left: calc(20px + env(safe-area-inset-left, 0px));
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    max-width: min(26rem, calc(100vw - 120px));
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+    color: #e9e6ff; text-shadow: 0 1px 12px rgba(5, 6, 15, .9);
+  }
+  #hud h1 { margin: 0 0 .35rem; font-size: 1.5rem; font-weight: 600; letter-spacing: .01em; }
+  #hud p { margin: 0; font-size: .95rem; line-height: 1.45; color: #bdb7e6; }
+  #hud.hidden { display: none; }
+</style>
+
+<script>
+/* ---------- shared helpers ---------- */
+const TAU = Math.PI * 2;
+const FOG = '#2b1d5c';
+const PALETTE = ['#39f0ff', '#ff4fd8', '#8a6bff', '#5dffb0'];
+const WALK_LIMIT = 98;            // metres from the landing pad you can roam
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function smooth(a, b, x) {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+/* Height of the ground at any point. Flat near the pad, dunes further out,
+   a jagged mountain rim at the edge. Everything that stands on the ground uses this. */
+function groundY(x, z) {
+  const r = Math.hypot(x, z);
+  let y = 0;
+  const k = smooth(14, 44, r);
+  if (k > 0) {
+    y += k * (1.7 * Math.sin(x * 0.055 + 1.3) * Math.cos(z * 0.048 - 0.4)
+            + 0.9 * Math.sin(x * 0.11 - z * 0.09)
+            + 0.3 * Math.sin(x * 0.31 + z * 0.27));
+  }
+  const m = smooth(102, 150, r);
+  if (m > 0) {
+    const a = Math.atan2(z, x);
+    y += m * m * (30 + 12 * Math.sin(a * 7 + 0.5) + 8 * Math.sin(a * 13 + 2) + 5 * Math.sin(a * 29));
+  }
+  return y;
+}
+
+/* ---------- ground ---------- */
+AFRAME.registerComponent('terrain', {
+  init() {
+    const geo = new THREE.PlaneGeometry(330, 330, 132, 132);
+    geo.rotateX(-Math.PI / 2);
+    const pos = geo.attributes.position;
+    const col = new Float32Array(pos.count * 3);
+    const lo = new THREE.Color('#15112e'), mid = new THREE.Color('#2c2360'), hi = new THREE.Color('#6a55b8');
+    const c = new THREE.Color();
+    for (let i = 0; i < pos.count; i++) {
+      const y = groundY(pos.getX(i), pos.getZ(i));
+      pos.setY(i, y);
+      if (y < 3) c.copy(lo).lerp(mid, Math.min(1, Math.max(0, (y + 2.5) / 5.5)));
+      else c.copy(mid).lerp(hi, Math.min(1, (y - 3) / 34));
+      col[i * 3] = c.r; col[i * 3 + 1] = c.g; col[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 1, metalness: 0 });
+    this.el.setObject3D('mesh', new THREE.Mesh(geo, mat));
+  }
+});
+
+/* ---------- sky, planet, rocks, crystals, islands, beacons, motes, orbs ---------- */
+AFRAME.registerComponent('world', {
+  init() {
+    const scene = this.el.sceneEl, root = this.el.object3D;
+    const rand = mulberry32(20261005);
+    const R = (a, b) => a + rand() * (b - a);
+    const dummy = new THREE.Object3D();
+
+    /* sky dome, stars, planet: grouped so they follow you and feel infinitely far */
+    const sky = this.sky = new THREE.Group();
+    root.add(sky);
+
+    const skyCanvas = document.createElement('canvas');
+    skyCanvas.width = 4; skyCanvas.height = 512;
+    let g = skyCanvas.getContext('2d');
+    let grad = g.createLinearGradient(0, 0, 0, 512);
+    grad.addColorStop(0, '#02030a'); grad.addColorStop(0.25, '#060a22');
+    grad.addColorStop(0.42, '#17154c'); grad.addColorStop(0.5, FOG); grad.addColorStop(1, FOG);
+    g.fillStyle = grad; g.fillRect(0, 0, 4, 512);
+    const skyTex = new THREE.CanvasTexture(skyCanvas);
+    skyTex.colorSpace = THREE.SRGBColorSpace;
+    sky.add(new THREE.Mesh(new THREE.SphereGeometry(450, 32, 24),
+      new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false, depthWrite: false })));
+
+    const nStars = 1800, sp = new Float32Array(nStars * 3), sc = new Float32Array(nStars * 3), c = new THREE.Color();
+    for (let i = 0; i < nStars; i++) {
+      const u = R(0.02, 1), a = R(0, TAU), rr = Math.sqrt(1 - u * u);
+      sp[i * 3] = Math.cos(a) * rr * 420; sp[i * 3 + 1] = u * 420; sp[i * 3 + 2] = Math.sin(a) * rr * 420;
+      c.setHSL(R(0.5, 0.78), R(0.1, 0.6), R(0.45, 0.95));
+      sc[i * 3] = c.r; sc[i * 3 + 1] = c.g; sc[i * 3 + 2] = c.b;
+    }
+    const starGeo = new THREE.BufferGeometry();
+    starGeo.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+    starGeo.setAttribute('color', new THREE.BufferAttribute(sc, 3));
+    const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ size: 2.6, sizeAttenuation: false, vertexColors: true, fog: false, depthWrite: false }));
+    stars.frustumCulled = false;
+    sky.add(stars);
+
+    /* ringed gas giant */
+    const pc = document.createElement('canvas'); pc.width = 512; pc.height = 256;
+    g = pc.getContext('2d');
+    grad = g.createLinearGradient(0, 0, 0, 256);
+    const bands = ['#f2b680', '#c96a5a', '#7d3b6b', '#e8d2a6', '#a14f6a', '#f6dcb4', '#d98a6a'];
+    let stop = 0, bi = 0;
+    while (stop < 1) { grad.addColorStop(stop, bands[bi++ % bands.length]); stop += R(0.035, 0.11); }
+    grad.addColorStop(1, bands[2]);
+    g.fillStyle = grad; g.fillRect(0, 0, 512, 256);
+    g.globalAlpha = 0.22;
+    for (let i = 0; i < 70; i++) {
+      g.fillStyle = rand() < 0.5 ? '#fff2d8' : '#4a2350';
+      g.beginPath(); g.ellipse(R(0, 512), R(0, 256), R(20, 110), R(1, 4), 0, 0, TAU); g.fill();
+    }
+    const planetTex = new THREE.CanvasTexture(pc); planetTex.colorSpace = THREE.SRGBColorSpace;
+    const planet = new THREE.Group();
+    planet.position.set(-120, 118, -260);
+    planet.rotation.set(0.22, 0, 0.32);
+    planet.add(new THREE.Mesh(new THREE.SphereGeometry(60, 48, 32),
+      new THREE.MeshLambertMaterial({ map: planetTex, emissive: new THREE.Color('#2a1230'), fog: false })));
+
+    const rc = document.createElement('canvas'); rc.width = rc.height = 512;
+    g = rc.getContext('2d');
+    grad = g.createRadialGradient(256, 256, 256 * 0.6, 256, 256, 256);
+    grad.addColorStop(0, 'rgba(255,226,190,0)');
+    grad.addColorStop(0.06, 'rgba(255,226,190,0.55)');
+    grad.addColorStop(0.3, 'rgba(232,170,170,0.75)');
+    grad.addColorStop(0.36, 'rgba(232,170,170,0.08)');
+    grad.addColorStop(0.44, 'rgba(255,214,200,0.6)');
+    grad.addColorStop(0.72, 'rgba(190,140,210,0.5)');
+    grad.addColorStop(0.8, 'rgba(190,140,210,0.1)');
+    grad.addColorStop(0.9, 'rgba(255,230,220,0.35)');
+    grad.addColorStop(1, 'rgba(255,230,220,0)');
+    g.fillStyle = grad; g.fillRect(0, 0, 512, 512);
+    const ringTex = new THREE.CanvasTexture(rc); ringTex.colorSpace = THREE.SRGBColorSpace;
+    const ring = new THREE.Mesh(new THREE.RingGeometry(76, 126, 96),
+      new THREE.MeshBasicMaterial({ map: ringTex, transparent: true, side: THREE.DoubleSide, fog: false, depthWrite: false }));
+    ring.rotation.x = Math.PI / 2;
+    planet.add(ring);
+    sky.add(planet);
+
+    const moonA = new THREE.Mesh(new THREE.SphereGeometry(9, 20, 14), new THREE.MeshLambertMaterial({ color: '#cfd3ff', fog: false }));
+    moonA.position.set(170, 190, -210); sky.add(moonA);
+    const moonB = new THREE.Mesh(new THREE.SphereGeometry(4, 16, 12), new THREE.MeshLambertMaterial({ color: '#ffb0c8', fog: false }));
+    moonB.position.set(40, 96, -300); sky.add(moonB);
+
+    /* keep clear of the gate, the lander and the sign when scattering things */
+    const blocked = (x, z) => Math.hypot(x, z + 13) < 6 || Math.hypot(x - 10, z - 6) < 4.5 || Math.hypot(x, z) < 8;
+
+    /* rocks: one instanced mesh */
+    const rockMat = new THREE.MeshStandardMaterial({ color: '#2d2850', flatShading: true, roughness: 0.95 });
+    const nRocks = 54;
+    const rocks = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1, 0), rockMat, nRocks);
+    for (let i = 0; i < nRocks; i++) {
+      let x, z;
+      do { const a = R(0, TAU), r = R(9, 96); x = Math.cos(a) * r; z = Math.sin(a) * r; } while (blocked(x, z));
+      const s = R(0.3, 2.4);
+      dummy.position.set(x, groundY(x, z) + s * 0.15, z);
+      dummy.rotation.set(R(0, TAU), R(0, TAU), R(0, TAU));
+      dummy.scale.set(s * R(0.7, 1.3), s * R(0.45, 0.9), s * R(0.7, 1.3));
+      dummy.updateMatrix(); rocks.setMatrixAt(i, dummy.matrix);
+    }
+    rocks.frustumCulled = false;
+    root.add(rocks);
+
+    /* crystals: one instanced mesh per colour */
+    const crystalMats = PALETTE.map(col => new THREE.MeshStandardMaterial({
+      color: col, emissive: col, emissiveIntensity: 0.85, flatShading: true, roughness: 0.25, metalness: 0.1 }));
+    const crystalGeo = new THREE.ConeGeometry(1, 1, 5); crystalGeo.translate(0, 0.5, 0);
+    const lists = PALETTE.map(() => []);
+    const clusters = [];
+    const addCluster = (x, z, ci, big) => {
+      const n = 3 + Math.floor(rand() * 4);
+      for (let j = 0; j < n; j++) {
+        const px = x + R(-1.3, 1.3), pz = z + R(-1.3, 1.3);
+        const h = R(0.8, 3.4) * (big ? 1.9 : 1) * (j === 0 ? 1.4 : 1);
+        dummy.position.set(px, groundY(px, pz) - 0.15, pz);
+        dummy.rotation.set(R(-0.45, 0.45), R(0, TAU), R(-0.45, 0.45));
+        dummy.scale.set(h * R(0.1, 0.17), h, h * R(0.1, 0.17));
+        dummy.updateMatrix(); lists[ci].push(dummy.matrix.clone());
+      }
+      clusters.push({ x, z, ci });
+    };
+    for (let i = 0; i < 20; i++) {
+      let x, z;
+      do { const a = R(0, TAU), r = i < 6 ? R(9, 19) : R(20, 94); x = Math.cos(a) * r; z = Math.sin(a) * r; } while (blocked(x, z));
+      addCluster(x, z, i % PALETTE.length, i % 5 === 0);
+    }
+
+    /* beacons: tall beams of light marking places worth walking to */
+    for (let i = 0; i < 4; i++) {
+      const a = i * TAU / 4 + 0.6, r = 70 + (i % 2) * 12;
+      const x = Math.cos(a) * r, z = Math.sin(a) * r, gy = groundY(x, z);
+      const pylon = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.95, 3.2, 6), rockMat);
+      pylon.position.set(x, gy + 1.5, z); root.add(pylon);
+      const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.35, 150, 10, 1, true),
+        new THREE.MeshBasicMaterial({ color: PALETTE[i], transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending,
+          depthWrite: false, fog: false, side: THREE.DoubleSide }));
+      beam.position.set(x, gy + 78, z); root.add(beam);
+      addCluster(x + 2.2, z + 1.2, i, true);
+    }
+
+    lists.forEach((list, ci) => {
+      const im = new THREE.InstancedMesh(crystalGeo, crystalMats[ci], list.length);
+      list.forEach((m, i) => im.setMatrixAt(i, m));
+      im.frustumCulled = false;
+      root.add(im);
+    });
+
+    /* a few coloured lights so the nearest crystals spill onto the ground */
+    clusters.slice(0, 3).forEach(cl => {
+      const light = new THREE.PointLight(PALETTE[cl.ci], 26, 20, 2);
+      light.position.set(cl.x, groundY(cl.x, cl.z) + 1.6, cl.z);
+      root.add(light);
+    });
+
+    /* floating islands */
+    const topGeo = new THREE.DodecahedronGeometry(1, 1);
+    const botGeo = new THREE.ConeGeometry(1, 1, 7); botGeo.rotateX(Math.PI);
+    this.islands = [];
+    for (let i = 0; i < 6; i++) {
+      const grp = new THREE.Group();
+      const s = R(2.6, 6), a = i / 6 * TAU + R(-0.3, 0.3), r = R(24, 60);
+      grp.position.set(Math.cos(a) * r, 0, Math.sin(a) * r);
+      const top = new THREE.Mesh(topGeo, rockMat); top.scale.set(s, s * 0.32, s); grp.add(top);
+      const bot = new THREE.Mesh(botGeo, rockMat); bot.scale.set(s * 0.82, s * 1.5, s * 0.82); bot.position.y = -s * 0.75; grp.add(bot);
+      const ci = Math.floor(rand() * PALETTE.length);
+      for (let j = 0; j < 3; j++) {
+        const cr = new THREE.Mesh(crystalGeo, crystalMats[ci]);
+        const h = s * R(0.25, 0.7);
+        cr.scale.set(h * 0.14, h, h * 0.14);
+        cr.position.set(R(-0.4, 0.4) * s, s * 0.22, R(-0.4, 0.4) * s);
+        cr.rotation.set(R(-0.4, 0.4), 0, R(-0.4, 0.4));
+        grp.add(cr);
+      }
+      grp.userData = { baseY: R(9, 22), phase: R(0, TAU), spin: R(-0.04, 0.04) };
+      grp.position.y = grp.userData.baseY;
+      root.add(grp); this.islands.push(grp);
+    }
+
+    /* drifting motes of light */
+    const nM = this.nMotes = 260;
+    const mp = this.motePos = new Float32Array(nM * 3);
+    this.moteSpeed = new Float32Array(nM);
+    for (let i = 0; i < nM; i++) {
+      const a = R(0, TAU), r = Math.sqrt(rand()) * 48;
+      mp[i * 3] = Math.cos(a) * r; mp[i * 3 + 2] = Math.sin(a) * r;
+      mp[i * 3 + 1] = groundY(mp[i * 3], mp[i * 3 + 2]) + R(0.2, 7);
+      this.moteSpeed[i] = R(0.08, 0.35);
+    }
+    const moteGeo = this.moteGeo = new THREE.BufferGeometry();
+    moteGeo.setAttribute('position', new THREE.BufferAttribute(mp, 3));
+    const motes = new THREE.Points(moteGeo, new THREE.PointsMaterial({ color: '#bff8ff', size: 0.07, sizeAttenuation: true,
+      transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+    motes.frustumCulled = false;
+    root.add(motes);
+
+    /* orbs you can pick up, within a few steps of where you start */
+    const orbSpots = [[-0.7, 1.15, -1.1], [0.75, 1.3, -1.2], [0, 1.0, -1.9], [-1.8, 1.4, -0.4], [1.9, 1.1, -0.2],
+                      [-1.3, 1.25, 1.4], [1.2, 1.35, 1.6], [2.6, 1.2, -2.6], [-2.8, 1.05, -2.4]];
+    orbSpots.forEach((p, i) => {
+      const col = PALETTE[i % PALETTE.length];
+      const orb = document.createElement('a-entity');
+      orb.classList.add('grabbable');
+      orb.setAttribute('geometry', 'primitive: icosahedron; radius: 0.085; detail: 1');
+      orb.setAttribute('material', `color: ${col}; emissive: ${col}; emissiveIntensity: 1.1; flatShading: true; roughness: 0.3`);
+      orb.setAttribute('position', { x: p[0], y: p[1], z: p[2] });
+      orb.setAttribute('drift', '');
+      scene.appendChild(orb);
+    });
+  },
+
+  tick(t, dt) {
+    const time = t / 1000, s = Math.min(dt || 0, 50) / 1000;
+    for (const isl of this.islands) {
+      const u = isl.userData;
+      isl.position.y = u.baseY + Math.sin(time * 0.3 + u.phase) * 0.7;
+      isl.rotation.y += u.spin * s;
+    }
+    const mp = this.motePos;
+    for (let i = 0; i < this.nMotes; i++) {
+      const k = i * 3;
+      mp[k + 1] += this.moteSpeed[i] * s;
+      mp[k] += Math.sin(time * 0.4 + i) * 0.05 * s;
+      const gy = groundY(mp[k], mp[k + 2]);
+      if (mp[k + 1] > gy + 7.5) mp[k + 1] = gy + 0.2;
+    }
+    this.moteGeo.attributes.position.needsUpdate = true;
+
+    this.rig = this.rig || document.querySelector('#rig');
+    if (this.rig) this.sky.position.set(this.rig.object3D.position.x, 0, this.rig.object3D.position.z);
+  }
+});
+
+/* ---------- sign with the controls, drawn on a canvas so it needs no font download ---------- */
+AFRAME.registerComponent('sign', {
+  init() {
+    const W = 1024, H = 560, cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const g = cv.getContext('2d');
+    g.fillStyle = 'rgba(9, 8, 26, 0.86)'; g.fillRect(0, 0, W, H);
+    g.strokeStyle = '#39f0ff'; g.lineWidth = 3; g.strokeRect(12, 12, W - 24, H - 24);
+    const font = '"Avenir Next", "Segoe UI", system-ui, sans-serif';
+    g.fillStyle = '#ffffff'; g.font = '600 66px ' + font; g.fillText('Outpost Lumen', 56, 112);
+    const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'],
+                  ['Right trigger', 'Hold to aim, release to teleport'], ['Grip', 'Pick up and throw the orbs']];
+    rows.forEach((row, i) => {
+      const y = 214 + i * 86;
+      g.font = '600 36px ' + font; g.fillStyle = '#39f0ff'; g.fillText(row[0], 56, y);
+      g.font = '36px ' + font; g.fillStyle = '#e9e6ff'; g.fillText(row[1], 372, y);
+    });
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+    const w = 2.3;
+    this.el.setObject3D('mesh', new THREE.Mesh(new THREE.PlaneGeometry(w, w * H / W),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, fog: false, side: THREE.DoubleSide })));
+  }
+});
+
+/* ---------- walking, turning, teleporting ---------- */
+AFRAME.registerComponent('locomotion', {
+  init() {
+    const el = this.el, scene = el.sceneEl;
+    this.head = el.querySelector('#head');
+    this.left = el.querySelector('#leftHand');
+    this.right = el.querySelector('#rightHand');
+    this.move = { x: 0, y: 0 };
+    this.turnLatch = false;
+    this.aiming = false;
+    this.hasTarget = false;
+    this.target = new THREE.Vector3();
+    // Pointing direction of a Quest 3 controller in its own space; replaced by the real value once the controller loads.
+    this.rayDir = new THREE.Vector3(-0.124, -0.594, -0.795).normalize();
+    this.rayOrg = new THREE.Vector3(-0.0065, -0.0186, -0.05);
+    this.P = new THREE.Vector3(); this.P2 = new THREE.Vector3(); this.F = new THREE.Vector3();
+    this.O = new THREE.Vector3(); this.V = new THREE.Vector3(); this.Q = new THREE.Quaternion();
+
+    this.left.addEventListener('thumbstickmoved', e => { this.move.x = e.detail.x; this.move.y = e.detail.y; });
+    this.left.addEventListener('controllerdisconnected', () => { this.move.x = this.move.y = 0; });
+    this.right.addEventListener('thumbstickmoved', e => this.onTurn(e.detail.x));
+    this.right.addEventListener('triggerdown', () => { this.aiming = true; });
+    this.right.addEventListener('triggerup', () => this.finishTeleport());
+    this.right.addEventListener('controllermodelready', e => {
+      const r = e.detail && e.detail.rayOrigin;
+      if (r && r.direction && r.origin) { this.rayDir.copy(r.direction).normalize(); this.rayOrg.copy(r.origin); }
+    });
+
+    this.N = 64;
+    this.arcPts = new Float32Array(this.N * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(this.arcPts, 3));
+    this.arc = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x6ff3ff, transparent: true, opacity: 0.9, fog: false }));
+    this.arc.frustumCulled = false; this.arc.visible = false;
+    scene.object3D.add(this.arc);
+    const ringGeo = new THREE.RingGeometry(0.26, 0.36, 32); ringGeo.rotateX(-Math.PI / 2);
+    this.reticle = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0x6ff3ff, fog: false, transparent: true, opacity: 0.95, side: THREE.DoubleSide }));
+    this.reticle.visible = false;
+    scene.object3D.add(this.reticle);
+  },
+
+  onTurn(x) {
+    if (Math.abs(x) < 0.3) { this.turnLatch = false; return; }
+    if (this.turnLatch || Math.abs(x) < 0.7) return;
+    this.turnLatch = true;
+    const rig = this.el.object3D;
+    this.head.object3D.getWorldPosition(this.P);
+    rig.rotation.y += (x > 0 ? -1 : 1) * Math.PI / 6;
+    rig.updateMatrixWorld(true);
+    this.head.object3D.getWorldPosition(this.P2);       // pivot around your head, not the room centre
+    rig.position.x += this.P.x - this.P2.x;
+    rig.position.z += this.P.z - this.P2.z;
+  },
+
+  updateArc() {
+    const hand = this.right.object3D, pts = this.arcPts, N = this.N;
+    hand.updateWorldMatrix(true, false);
+    this.O.copy(this.rayOrg).applyMatrix4(hand.matrixWorld);
+    this.V.copy(this.rayDir).transformDirection(hand.matrixWorld).multiplyScalar(12);
+    const step = 0.04, grav = -9.8;
+    let px = this.O.x, py = this.O.y, pz = this.O.z, n = 0, hit = false;
+    for (let i = 0; i < N; i++) {
+      const gy = groundY(px, pz);
+      if (i > 0 && py <= gy) { py = gy; hit = true; }
+      pts[i * 3] = px; pts[i * 3 + 1] = py; pts[i * 3 + 2] = pz; n = i + 1;
+      if (hit) break;
+      px += this.V.x * step; py += this.V.y * step; pz += this.V.z * step;
+      this.V.y += grav * step;
+    }
+    this.arc.geometry.setDrawRange(0, n);
+    this.arc.geometry.attributes.position.needsUpdate = true;
+    this.arc.visible = true;
+    this.hasTarget = hit && Math.hypot(px, pz) < WALK_LIMIT;
+    this.reticle.visible = this.hasTarget;
+    if (this.hasTarget) { this.target.set(px, py, pz); this.reticle.position.set(px, py + 0.05, pz); }
+  },
+
+  finishTeleport() {
+    if (this.aiming && this.hasTarget) {
+      const rig = this.el.object3D;
+      this.head.object3D.getWorldPosition(this.P);
+      rig.position.x += this.target.x - this.P.x;
+      rig.position.z += this.target.z - this.P.z;
+      rig.position.y = groundY(this.target.x, this.target.z);
+    }
+    this.aiming = false; this.hasTarget = false;
+    this.arc.visible = false; this.reticle.visible = false;
+  },
+
+  tick(t, dt) {
+    if (!dt) return;
+    const s = Math.min(dt, 50) / 1000, rig = this.el.object3D, P = this.P, F = this.F;
+    const mx = this.move.x, my = this.move.y;
+    if (Math.abs(mx) > 0.15 || Math.abs(my) > 0.15) {
+      this.head.object3D.getWorldQuaternion(this.Q);
+      F.set(0, 0, -1).applyQuaternion(this.Q); F.y = 0;
+      if (F.lengthSq() < 1e-4) F.set(0, 0, -1);
+      F.normalize();
+      const sp = 2.6 * s;                                // walking speed, metres per second
+      rig.position.x += (F.x * -my + -F.z * mx) * sp;
+      rig.position.z += (F.z * -my + F.x * mx) * sp;
+    }
+    // keep you inside the valley and standing on the ground
+    this.head.object3D.getWorldPosition(P);
+    const r = Math.hypot(P.x, P.z);
+    if (r > WALK_LIMIT) {
+      const k = WALK_LIMIT / r;
+      rig.position.x += P.x * k - P.x; rig.position.z += P.z * k - P.z;
+      P.x *= k; P.z *= k;
+    }
+    const gy = groundY(P.x, P.z);
+    rig.position.y += (gy - rig.position.y) * Math.min(1, s * 12);
+
+    if (this.aiming) this.updateArc();
+  }
+});
+
+/* ---------- picking things up ---------- */
+AFRAME.registerComponent('grabber', {
+  init() {
+    this.held = null;
+    this.prev = new THREE.Vector3(); this.now = new THREE.Vector3();
+    this.vel = new THREE.Vector3(); this.tmp = new THREE.Vector3();
+    this.el.addEventListener('gripdown', () => this.grab());
+    this.el.addEventListener('gripup', () => this.release());
+    this.el.addEventListener('controllerdisconnected', () => this.release());
+  },
+  pulse(strength, ms) {
+    try {
+      const gp = this.el.components['tracked-controls'].controller.gamepad;
+      gp.hapticActuators[0].pulse(strength, ms);
+    } catch (e) { /* no haptics available */ }
+  },
+  grab() {
+    if (this.held) return;
+    this.el.object3D.getWorldPosition(this.now);
+    let best = null, bestD = 0.4;                        // reach, in metres
+    document.querySelectorAll('.grabbable').forEach(el => {
+      if (el.is('held')) return;
+      const d = el.object3D.getWorldPosition(this.tmp).distanceTo(this.now);
+      if (d < bestD) { bestD = d; best = el; }
+    });
+    if (!best) return;
+    this.el.object3D.attach(best.object3D);
+    best.addState('held');
+    this.held = best;
+    this.pulse(0.6, 40);
+  },
+  release() {
+    const el = this.held;
+    if (!el) return;
+    this.el.sceneEl.object3D.attach(el.object3D);
+    el.removeState('held');
+    if (el.components.drift) el.components.drift.vel.copy(this.vel);
+    this.held = null;
+  },
+  tick(t, dt) {
+    if (!dt) return;
+    this.el.object3D.getWorldPosition(this.now);
+    this.tmp.copy(this.now).sub(this.prev).divideScalar(dt / 1000);
+    this.vel.lerp(this.tmp, 0.5);
+    this.prev.copy(this.now);
+  }
+});
+
+/* thrown orbs glide, slow down and bounce softly off the ground */
+AFRAME.registerComponent('drift', {
+  init() { this.vel = new THREE.Vector3(); },
+  tick(t, dt) {
+    if (!dt || this.el.is('held')) return;
+    const s = Math.min(dt, 50) / 1000, o = this.el.object3D, v = this.vel;
+    o.rotation.y += s * 0.6;
+    if (v.lengthSq() < 1e-6) return;
+    o.position.addScaledVector(v, s);
+    v.multiplyScalar(Math.exp(-0.9 * s));
+    const floor = groundY(o.position.x, o.position.z) + 0.2;
+    if (o.position.y < floor) { o.position.y = floor; v.y = Math.abs(v.y) * 0.5; }
+    if (v.lengthSq() < 0.0004) v.set(0, 0, 0);
+  }
+});
+</script>
+</head>
+
+<body>
+<div id="hud">
+  <h1>Outpost Lumen</h1>
+  <p id="hint">Drag to look around and use the W, A, S and D keys to walk. Open this page in the Meta Quest browser to step inside.</p>
+</div>
+
+<a-scene
+  background="color: #05060f"
+  fog="type: exponential; color: #2b1d5c; density: 0.0075"
+  renderer="antialias: true; colorManagement: true; highRefreshRate: true; foveationLevel: 1"
+  loading-screen="backgroundColor: #05060f; dotsColor: #39f0ff">
+
+  <!-- light: a low sun off to the right, plus a soft violet fill -->
+  <a-entity light="type: hemisphere; color: #8f9bff; groundColor: #3a1650; intensity: 1.5"></a-entity>
+  <a-entity light="type: directional; color: #ffd9b0; intensity: 2.4" position="140 70 -60"></a-entity>
+
+  <a-entity terrain></a-entity>
+  <a-entity world></a-entity>
+
+  <!-- landing pad you start on -->
+  <a-cylinder radius="6" height="0.04" segments-radial="6" material="color: #3b3668; roughness: 0.9; metalness: 0; flatShading: true"></a-cylinder>
+  <a-ring radius-inner="5.05" radius-outer="5.2" rotation="-90 0 0" position="0 0.03 0" material="shader: flat; color: #39f0ff"></a-ring>
+  <a-ring radius-inner="1.6" radius-outer="1.66" rotation="-90 0 0" position="0 0.03 0" material="shader: flat; color: #8a6bff"></a-ring>
+
+  <a-entity sign position="-2.9 1.45 -3.4" rotation="0 38 0"></a-entity>
+
+  <!-- the gate -->
+  <a-entity position="0 0 -13">
+    <a-box width="7.4" height="0.3" depth="1.8" position="0 0.15 0" material="color: #1b1936; roughness: 0.5; metalness: 0.4"></a-box>
+    <a-torus radius="3" radius-tubular="0.26" segments-tubular="56" position="0 3.5 0" material="color: #23203f; roughness: 0.35; metalness: 0.6"></a-torus>
+    <a-torus radius="2.72" radius-tubular="0.045" segments-tubular="56" position="0 3.5 0" material="shader: flat; color: #39f0ff"></a-torus>
+    <a-circle radius="2.7" position="0 3.5 0" material="shader: flat; color: #8a6bff; transparent: true; opacity: 0.2; side: double; fog: false"
+              animation="property: material.opacity; from: 0.1; to: 0.36; dir: alternate; loop: true; dur: 2600; easing: easeInOutSine"></a-circle>
+    <a-torus radius="3.9" radius-tubular="0.035" segments-tubular="64" position="0 3.5 0" material="shader: flat; color: #ff4fd8"
+             animation="property: rotation; from: 0 0 0; to: 0 360 0; loop: true; dur: 16000; easing: linear"></a-torus>
+    <a-torus radius="4.4" radius-tubular="0.03" segments-tubular="64" position="0 3.5 0" material="shader: flat; color: #5dffb0"
+             animation="property: rotation; from: 62 0 0; to: 62 -360 0; loop: true; dur: 23000; easing: linear"></a-torus>
+    <a-entity light="type: point; color: #39f0ff; intensity: 40; distance: 26; decay: 2" position="0 3.5 1.6"></a-entity>
+  </a-entity>
+
+  <!-- the lander that brought you here -->
+  <a-entity position="10 0 6" rotation="0 -30 0">
+    <a-cone radius-bottom="1.6" radius-top="0.72" height="2.3" segments-radial="8" position="0 2.15 0" material="color: #cfcbe0; roughness: 0.45; metalness: 0.5; flatShading: true"></a-cone>
+    <a-sphere radius="0.74" segments-width="10" segments-height="6" position="0 3.28 0" material="color: #ffb45e; emissive: #ffb45e; emissiveIntensity: 0.9; flatShading: true"></a-sphere>
+    <a-cylinder radius="1.15" height="0.45" segments-radial="8" position="0 0.82 0" material="color: #23203f; roughness: 0.6; metalness: 0.5; flatShading: true"></a-cylinder>
+    <a-ring radius-inner="0.5" radius-outer="0.95" rotation="90 0 0" position="0 0.59 0" material="shader: flat; color: #ff8a3c; side: double"></a-ring>
+    <a-entity rotation="0 0 0"><a-cylinder radius="0.07" height="2.1" position="1.75 0.95 0" rotation="0 0 26" material="color: #8d88a8; metalness: 0.6; roughness: 0.4"></a-cylinder><a-cylinder radius="0.27" height="0.06" position="2.2 0.03 0" material="color: #8d88a8"></a-cylinder></a-entity>
+    <a-entity rotation="0 120 0"><a-cylinder radius="0.07" height="2.1" position="1.75 0.95 0" rotation="0 0 26" material="color: #8d88a8; metalness: 0.6; roughness: 0.4"></a-cylinder><a-cylinder radius="0.27" height="0.06" position="2.2 0.03 0" material="color: #8d88a8"></a-cylinder></a-entity>
+    <a-entity rotation="0 240 0"><a-cylinder radius="0.07" height="2.1" position="1.75 0.95 0" rotation="0 0 26" material="color: #8d88a8; metalness: 0.6; roughness: 0.4"></a-cylinder><a-cylinder radius="0.27" height="0.06" position="2.2 0.03 0" material="color: #8d88a8"></a-cylinder></a-entity>
+  </a-entity>
+
+  <!-- you -->
+  <a-entity id="rig" locomotion>
+    <a-entity id="head" camera="far: 2000" look-controls wasd-controls="acceleration: 40" position="0 1.6 0"></a-entity>
+    <a-entity id="leftHand" meta-touch-controls="hand: left" grabber></a-entity>
+    <a-entity id="rightHand" meta-touch-controls="hand: right" grabber></a-entity>
+  </a-entity>
+</a-scene>
+
+<script>
+  (function () {
+    const scene = document.querySelector('a-scene'), hud = document.getElementById('hud'), hint = document.getElementById('hint');
+    scene.addEventListener('enter-vr', () => hud.classList.add('hidden'));
+    scene.addEventListener('exit-vr', () => hud.classList.remove('hidden'));
+    if (navigator.xr && navigator.xr.isSessionSupported) {
+      navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+        if (ok) hint.textContent = 'Select the VR button in the corner to step inside.';
+      }).catch(() => {});
+    }
+  })();
+</script>
+</body>
+</html>

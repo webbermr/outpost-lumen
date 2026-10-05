@@ -25,6 +25,7 @@
     padding: .7rem 1.4rem; border-radius: .6rem; border: 2px solid #f1efe9;
     background: rgba(20, 20, 28, .75); color: #f1efe9;
   }
+  #hud #build { font-size: .8rem; color: #8f8a7e; margin: 0; }
   #enter:hover, #enter:focus-visible { background: #f1efe9; color: #14141c; outline: none; }
   #enter[hidden] { display: none; }
 </style>
@@ -43,13 +44,15 @@
   <h1>Scanned room</h1>
   <p id="status">Loading the room…</p>
   <button id="enter" hidden>Enter VR</button>
-  <p id="keys">Drag to look. W, A, S and D walk. Click a ball or an item to pick it up. An item then sits on whatever you point at, including on top of another item, and a second click leaves it there. N adds an office item. Delete removes the item you are holding or pointing at. Space throws a ball. M switches between the splat and the mesh. R clears up.</p>
+  <p id="keys">Drag to look. W, A, S and D walk. Click a ball or an item to pick it up. An item then sits on whatever you point at, including on top of another item, and a second click leaves it there. N adds an office item. Delete, Backspace or a right-click removes whatever is outlined or carried. Space throws a ball. M switches between the splat and the mesh. R resets.</p>
+  <p id="build">Build 6</p>
 </div>
 
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 
 /* ------------------------------------------------------------------
    Settings. To use a different scan, change the two file names, or add
@@ -331,7 +334,7 @@ const items = [];
 function addItem(mesh, opts) {
   scene.add(mesh);
   const it = Object.assign({ mesh, home: mesh.position.clone(), vel: new V3(), moving: false, heldBy: null, quiet: 0,
-    kind: 'ball', r: CONFIG.ballRadius, h: CONFIG.ballRadius * 2, pick: 0.1, spawned: false, hovering: false, upright: null, top: null, grounded: false }, opts);
+    kind: 'ball', r: CONFIG.ballRadius, h: CONFIG.ballRadius * 2, pick: 0.1, spawned: false, hovering: false, upright: null, top: null, grounded: false, gone: false }, opts);
   items.push(it);
   return it;
 }
@@ -479,20 +482,24 @@ const CATALOG = [
   }
 ];
 let nextKind = 0;
-function spawnItem(kind) {                  // a new office item appears floating in front of you (next in the list unless a number is given)
+function spawnItem(kind, aside = 0) {       // a new office item appears floating in front of you (next in the list unless a number is given)
   for (const it of items) if (it.hovering) { it.hovering = false; it.moving = true; it.quiet = 0; }   // let the previous one drop
   const built = CATALOG[(Number.isInteger(kind) ? kind : nextKind++) % CATALOG.length]();
   rig.updateMatrixWorld(true);
   const head = headPosition(tmpA).clone(), f = headForward(tmpB);
-  built.group.position.set(head.x + f.x * 0.5, Math.max(room.floorY + 0.3, head.y - 0.4), head.z + f.z * 0.5);
+  built.group.position.set(head.x + f.x * 0.5 - f.z * aside, Math.max(room.floorY + 0.3, head.y - 0.4), head.z + f.z * 0.5 + f.x * aside);   // `aside`: metres to your right
   built.group.rotation.y = Math.atan2(-f.x, -f.z);
   const it = addItem(built.group, { kind: 'prop', r: built.r, h: built.h, pick: built.pick, top: built.top, spawned: true, hovering: true });
   const mine = items.filter(i => i.spawned);
   if (mine.length > 20) removeItem(mine[0]);
   return it;
 }
-function removeItem(it) {
+function removeItem(it) {                   // added items are deleted; balls are put away until the next reset
   if (it.heldBy) { it.heldBy.held = null; it.heldBy = null; } else wakeAbove(it);
+  if (!it.spawned) {
+    scene.attach(it.mesh); it.mesh.visible = false; it.gone = true; it.moving = false; it.vel.set(0, 0, 0);
+    return;
+  }
   it.mesh.removeFromParent();
   const k = items.indexOf(it); if (k >= 0) items.splice(k, 1);
 }
@@ -501,6 +508,7 @@ function resetItems() {                     // balls go back to the desk, added 
     if (it.spawned) { removeItem(it); continue; }
     if (it.heldBy) { it.heldBy.held = null; it.heldBy = null; scene.attach(it.mesh); }
     it.mesh.position.copy(it.home); it.vel.set(0, 0, 0); it.moving = false; it.quiet = 0;
+    it.gone = false; it.mesh.visible = true;
   }
 }
 /* ----- stacking: some items have a flat top that other things can rest on ----- */
@@ -509,7 +517,7 @@ function overTop(o, x, z, pad) {            // is the point (x, z) above item o'
   const dx = x - o.mesh.position.x, dz = z - o.mesh.position.z;
   return Math.abs(dx * c - dz * s) <= o.top.sx + pad && Math.abs(dx * s + dz * c) <= o.top.sz + pad;
 }
-const canSupport = o => o.top && !o.heldBy && !o.hovering && (!o.moving || o.grounded);
+const canSupport = o => o.top && !o.gone && !o.heldBy && !o.hovering && (!o.moving || o.grounded);
 function itemSupport(self, x, z, y, reach) { // highest item top under the point, no more than `reach` above y
   let best = -Infinity;
   const pad = Math.min(0.03, (self.r || 0.03) * 0.5);
@@ -525,7 +533,7 @@ function wakeAbove(a) {                     // when an item is taken away, whate
   if (!a.top) return;
   const topY = a.mesh.position.y + a.top.h;
   for (const o of items) {
-    if (o === a || o.heldBy || o.hovering || o.moving) continue;
+    if (o === a || o.gone || o.heldBy || o.hovering || o.moving) continue;
     const base = o.kind === 'ball' ? o.mesh.position.y - o.r : o.mesh.position.y;
     if (Math.abs(base - topY) < 0.03 && overTop(a, o.mesh.position.x, o.mesh.position.z, 0.03)) {
       o.moving = true; o.grounded = false; o.quiet = 0;
@@ -554,7 +562,7 @@ function releaseItem(it, velocity) {        // let go: balls bounce, office item
 }
 function updateItems(dt) {
   for (const it of items) {
-    if (it.heldBy) continue;
+    if (it.heldBy || it.gone) continue;
     const p = it.mesh.position, v = it.vel;
     if (it.kind === 'prop' && it.upright && it.mesh.quaternion.angleTo(it.upright) > 0.002) it.mesh.quaternion.slerp(it.upright, Math.min(1, dt * 10));
     if (!it.moving) continue;
@@ -672,7 +680,7 @@ function makeWristPanel() {
   g.fillStyle = '#14141c'; g.fillRect(0, 0, W, H);
   g.strokeStyle = '#7df9ff'; g.lineWidth = 4; g.strokeRect(6, 6, W - 12, H - 12);
   const font = '"Avenir Next", "Segoe UI", system-ui, sans-serif';
-  const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'], ['Right trigger', 'Teleport'], ['Grip', 'Pick up, put down'], ['Grip + trigger', 'Remove item'], ['B', 'New office item'], ['A', 'Splat or mesh'], ['X', 'Clear and reset']];
+  const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'], ['Right trigger', 'Teleport'], ['Grip', 'Pick up, put down'], ['Grip + trigger', 'Remove it'], ['B', 'New office item'], ['A', 'Splat or mesh'], ['X', 'Clear and reset']];
   rows.forEach((row, i) => {
     const y = 66 + i * 58;
     g.font = '600 34px ' + font; g.fillStyle = '#7df9ff'; g.fillText(row[0], 30, y);
@@ -685,49 +693,60 @@ function makeWristPanel() {
 }
 const wristPanel = makeWristPanel();
 
+const handModels = new XRHandModelFactory();
+function makeHand(ray, grip, xrHand) {       // one input slot: a controller, or a tracked hand when the controllers are put down
+  return { ray, grip, xrHand, gamepad: null, side: null, isHand: false, was: {}, held: null, vel: new V3(), last: new V3(), tracked: false, turnLatch: false,
+           pinch: false, pinchAt: 0, lost: 0, mode: null, point: new V3(), anchor: new V3() };
+}
 for (let i = 0; i < 2; i++) {
-  const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
+  const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i), xrHand = renderer.xr.getHand(i);
   grip.add(controllerModels.createControllerModel(grip));
-  rig.add(ray, grip);
-  const hand = { ray, grip, gamepad: null, side: null, was: {}, held: null, vel: new V3(), last: new V3(), tracked: false, turnLatch: false };
+  xrHand.add(handModels.createHandModel(xrHand, 'mesh'));
+  rig.add(ray, grip, xrHand);
+  const hand = makeHand(ray, grip, xrHand);
   ray.addEventListener('connected', e => {
     const src = e.data;
     if (!src || (src.handedness !== 'left' && src.handedness !== 'right')) return;
-    hand.side = src.handedness; hand.gamepad = src.gamepad || null; hand.tracked = false; hands[hand.side] = hand;
-    if (hand.side === 'left') grip.add(wristPanel);
+    hand.side = src.handedness; hand.gamepad = src.gamepad || null; hand.isHand = !!src.hand;
+    hand.tracked = false; hand.pinch = false; hand.mode = null; hand.was = {};
+    hands[hand.side] = hand;
+    if (hand.side === 'left') { if (hand.isHand) wristPanel.removeFromParent(); else grip.add(wristPanel); }
   });
   ray.addEventListener('disconnected', () => {
     if (hand.held) dropItem(hand, false);
+    if (hand.mode === 'aim') endTeleport(false);
+    if (hand.side === 'left') wristPanel.removeFromParent();
     if (hand.side && hands[hand.side] === hand) hands[hand.side] = null;
-    hand.gamepad = null; hand.side = null;
+    hand.gamepad = null; hand.side = null; hand.isHand = false; hand.pinch = false; hand.mode = null;
   });
 }
 function pad(hand) {
-  const gp = hand && hand.gamepad;
+  const gp = hand && !hand.isHand && hand.gamepad;
   if (!gp) return null;
   const down = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
   return { trigger: down(0), grip: down(1), primary: down(4), secondary: down(5), x: gp.axes[2] || 0, y: gp.axes[3] || 0 };
 }
 function buzz(hand, strength, ms) { try { hand.gamepad.hapticActuators[0].pulse(strength, ms); } catch (e) { /* no haptics */ } }
 
-function grabItem(hand) {
-  if (hand.held) return;
-  const hp = hand.grip.getWorldPosition(tmpA);
+function grabItem(hand, at, carrier) {       // `at`: where the grab happens; `carrier`: what the item then moves with
+  if (hand.held) return false;
+  const hp = at ? tmpA.copy(at) : hand.grip.getWorldPosition(tmpA);
   let best = null, bestD = Infinity;
   for (const it of items) {
-    if (it.heldBy) continue;
+    if (it.heldBy || it.gone) continue;
     const d = itemCenter(it, tmpB).distanceTo(hp) - it.pick;      // bigger things can be grabbed from further off
-    if (d < 0.12 && d < bestD) { bestD = d; best = it; }
+    if (d < (at ? 0.08 : 0.12) && d < bestD) { bestD = d; best = it; }
   }
-  if (!best) return;
+  if (!best) return false;
   wakeAbove(best);
-  hand.grip.attach(best.mesh);
+  (carrier || hand.grip).attach(best.mesh);
   best.heldBy = hand; best.moving = false; best.hovering = false; hand.held = best;
   buzz(hand, 0.6, 40);
+  return true;
 }
-function removeHeld(hand) {                 // trigger while holding an added item: remove just that one
+function removeHeld(hand) {                 // trigger while holding something: remove just that one
   const it = hand.held;
-  if (!it || !it.spawned) return;
+  if (!it) return;
   removeItem(it); buzz(hand, 1, 70);
 }
 function dropItem(hand, thrown) {
@@ -738,11 +757,12 @@ function dropItem(hand, thrown) {
 
 function updateVR(dt) {
   rig.position.y = room.floorY;
+  hoverBox.visible = false;
   if (settleFrames > 0 && --settleFrames === 0) placeHeadAt(room.start.x, room.start.z);   // wherever you stand in your real room, start in the clear
   const L = hands.left, R = hands.right, lp = pad(L), rp = pad(R);
 
   for (const hand of [L, R]) {                           // hand speed, for throwing
-    if (!hand) continue;
+    if (!hand || hand.isHand) continue;
     const p = hand.grip.getWorldPosition(tmpA);
     if (hand.tracked) { tmpB.copy(p).sub(hand.last).divideScalar(dt); hand.vel.lerp(tmpB, 0.5); }
     hand.last.copy(p); hand.tracked = true;
@@ -774,7 +794,133 @@ function updateVR(dt) {
       updateArc(tmpA, tmpB.set(0, 0, -1).applyQuaternion(tmpQ));
     }
     R.was = rp;
-  } else if (teleport.aiming) endTeleport(false);
+  } else if (teleport.aiming && !(R && R.isHand)) endTeleport(false);
+  updateHandTracking(dt);
+}
+
+/* ---------- hand tracking: no controllers needed ----------
+   Pinch (thumb and index finger together) on an item ...... pick it up; open your fingers to put it down
+   Right-hand pinch in empty space, held ..................... aim a teleport; open your fingers to go
+   Left-hand pinch in empty space, dragged sideways ......... turn
+   Raise your left hand ...................................... a small menu appears above the wrist; press its buttons with your right index finger */
+const hA = new V3(), hB = new V3(), hC = new V3(), hD = new V3(), hE = new V3();
+function jointWorld(hand, name, out) {
+  const j = hand.xrHand && hand.xrHand.joints && hand.xrHand.joints[name];
+  return j && j.visible ? j.getWorldPosition(out) : null;
+}
+function endPinch(hand, deliberate) {
+  if (hand.mode === 'grab') dropItem(hand, deliberate);
+  if (hand.mode === 'aim') endTeleport(deliberate);
+  hand.pinch = false; hand.mode = null;
+}
+function updateHandTracking(dt) {
+  const now = performance.now();
+  for (const side of ['left', 'right']) {
+    const hand = hands[side];
+    if (!hand || !hand.isHand) continue;
+    const thumb = jointWorld(hand, 'thumb-tip', hA), index = jointWorld(hand, 'index-finger-tip', hB);
+    if (!thumb || !index) {                              // the headset lost sight of the hand
+      hand.lost += dt; hand.tracked = false;
+      if (hand.pinch && hand.lost > 0.4) endPinch(hand, false);
+      continue;
+    }
+    hand.lost = 0;
+    const gap = thumb.distanceTo(index);
+    hC.copy(thumb).add(index).multiplyScalar(0.5);       // the pinch point
+    if (hand.tracked) { hD.copy(hC).sub(hand.last).divideScalar(dt); hand.vel.lerp(hD, 0.5); }
+    hand.last.copy(hC); hand.tracked = true; hand.point.copy(hC);
+
+    if (!hand.pinch && gap < 0.018) {                    // fingers just closed
+      hand.pinch = true; hand.pinchAt = now;
+      const wrist = hand.xrHand.joints['wrist'];
+      if (grabItem(hand, hC, wrist && wrist.visible ? wrist : hand.xrHand.joints['index-finger-tip'])) hand.mode = 'grab';
+      else if (handMenu.visible && hC.distanceTo(handMenu.position) < 0.16) hand.mode = 'menu';   // an empty pinch at the menu does nothing
+      else if (side === 'right') hand.mode = 'aim';
+      else { hand.mode = 'turn'; hand.anchor.copy(hC); }
+    } else if (hand.pinch && gap > 0.04) {               // fingers opened
+      endPinch(hand, true);
+    }
+    if (!hand.pinch) continue;
+
+    if (hand.mode === 'aim' && now - hand.pinchAt > 250) {
+      teleport.aiming = true;
+      rig.updateMatrixWorld(true);
+      hand.ray.getWorldPosition(hD); hand.ray.getWorldQuaternion(tmpQ);
+      updateArc(hD, hE.set(0, 0, -1).applyQuaternion(tmpQ));
+    } else if (hand.mode === 'turn') {
+      const f = headForward(hD), sideways = (hC.x - hand.anchor.x) * -f.z + (hC.z - hand.anchor.z) * f.x;
+      if (Math.abs(sideways) > 0.12) {
+        snapTurn((sideways > 0 ? -1 : 1) * Math.PI / 6);
+        rig.updateMatrixWorld(true);
+        const t = jointWorld(hand, 'thumb-tip', hA), i2 = jointWorld(hand, 'index-finger-tip', hB);
+        if (t && i2) hand.anchor.copy(t).add(i2).multiplyScalar(0.5); else hand.anchor.copy(hC);
+        hand.tracked = false;                            // the turn moved the hand in the world; do not count that as hand speed
+      }
+    }
+  }
+  updateHandMenu(now);
+}
+
+/* the hand menu: four buttons you press with a fingertip */
+const MENU = { w: 0.2, h: 0.15, cw: 800, ch: 600, pressed: -1, pressedAt: 0, inside: -1, lastAt: 0, shown: false,
+  buttons: [
+    { label: 'New item', x: 30, y: 30, w: 355, h: 150, act: () => spawnItem(undefined, 0.22) },      // to the right, clear of the menu hand
+    { label: 'Remove held', x: 415, y: 30, w: 355, h: 150, act: () => { const h = [hands.right, hands.left].find(k => k && k.held); if (h) removeHeld(h); } },
+    { label: 'Splat / mesh', x: 30, y: 205, w: 355, h: 150, act: () => toggleView() },
+    { label: 'Reset', x: 415, y: 205, w: 355, h: 150, act: () => resetItems() }
+  ] };
+const menuCanvas = document.createElement('canvas'); menuCanvas.width = MENU.cw; menuCanvas.height = MENU.ch;
+const menuTexture = new THREE.CanvasTexture(menuCanvas); menuTexture.colorSpace = THREE.SRGBColorSpace;
+function drawMenu() {
+  const g = menuCanvas.getContext('2d'), font = '"Avenir Next", "Segoe UI", system-ui, sans-serif';
+  g.fillStyle = '#14141c'; g.fillRect(0, 0, MENU.cw, MENU.ch);
+  MENU.buttons.forEach((b, i) => {
+    const on = i === MENU.pressed;
+    g.fillStyle = on ? '#7df9ff' : '#23232f'; g.fillRect(b.x, b.y, b.w, b.h);
+    g.strokeStyle = '#7df9ff'; g.lineWidth = 4; g.strokeRect(b.x, b.y, b.w, b.h);
+    g.fillStyle = on ? '#14141c' : '#f1efe9'; g.font = '600 44px ' + font; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+  });
+  g.textAlign = 'left'; g.textBaseline = 'alphabetic'; g.fillStyle = '#cfcabd'; g.font = '32px ' + font;
+  ['Pinch an item to pick it up, open to put it down', 'Right pinch and hold: teleport', 'Left pinch and drag sideways: turn'].forEach((line, i) => g.fillText(line, 30, 430 + i * 52));
+  menuTexture.needsUpdate = true;
+}
+drawMenu();
+const handMenu = new THREE.Mesh(new THREE.PlaneGeometry(MENU.w, MENU.h), new THREE.MeshBasicMaterial({ map: menuTexture, side: THREE.DoubleSide }));
+handMenu.visible = false; scene.add(handMenu);
+function menuButtonAt(x, y) {               // x, y in metres on the menu, origin at its centre
+  const px = (x / MENU.w + 0.5) * MENU.cw, py = (0.5 - y / MENU.h) * MENU.ch;
+  return MENU.buttons.findIndex(b => px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h);
+}
+function updateHandMenu(now) {
+  const L = hands.left, R = hands.right;
+  let show = false;
+  const wrist = L && L.isHand ? jointWorld(L, 'wrist', hA) : null;
+  if (wrist) {                               // shown while the left hand is held up in view
+    const head = headPosition(hB);
+    camera.getWorldQuaternion(tmpQ); hC.set(0, 0, -1).applyQuaternion(tmpQ);
+    hD.copy(wrist).sub(head);
+    const dist = hD.length(), facing = hD.normalize().dot(hC);
+    show = dist < 0.8 && facing > (MENU.shown ? 0.55 : 0.72);
+    if (show) { handMenu.position.copy(wrist); handMenu.position.y += 0.14; handMenu.lookAt(head); }
+  }
+  handMenu.visible = MENU.shown = show;
+  let hit = -1;
+  if (show && R && R.isHand) {
+    const tip = jointWorld(R, 'index-finger-tip', hE);
+    if (tip) {
+      handMenu.updateMatrixWorld(true);
+      handMenu.worldToLocal(tip);
+      if (tip.z < 0.015 && tip.z > -0.04) hit = menuButtonAt(tip.x, tip.y);
+    }
+  }
+  if (hit >= 0 && hit !== MENU.inside && now - MENU.lastAt > 500) {
+    MENU.lastAt = now; MENU.pressed = hit; MENU.pressedAt = now;
+    MENU.buttons[hit].act();
+    drawMenu();
+  }
+  MENU.inside = hit;
+  if (MENU.pressed >= 0 && now - MENU.pressedAt > 250) { MENU.pressed = -1; drawMenu(); }
 }
 
 /* ---------- desktop preview ---------- */
@@ -782,11 +928,19 @@ const keys = new Set();
 let yaw = 0, pitch = 0, dragging = false, nextBall = 0;
 const mouseHand = { held: null };            // stands in for a controller when you use the mouse
 const pointerStart = { x: 0, y: 0 }, picker = new THREE.Raycaster(), ndc = new THREE.Vector2();
+renderer.domElement.addEventListener('contextmenu', e => {            // right-click removes, for when the keyboard is not listening
+  e.preventDefault();
+  if (!room || renderer.xr.isPresenting) return;
+  ndc.set(e.clientX / window.innerWidth * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
+  removeAtPointer();
+});
 renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
   dragging = true; pointerStart.x = e.clientX; pointerStart.y = e.clientY;
   renderer.domElement.setPointerCapture(e.pointerId);
 });
 renderer.domElement.addEventListener('pointerup', e => {
+  if (e.button !== 0) return;
   dragging = false;
   if (!room || renderer.xr.isPresenting) return;
   if (Math.hypot(e.clientX - pointerStart.x, e.clientY - pointerStart.y) < 6) clickAt(e.clientX, e.clientY);   // a click, not a drag
@@ -805,8 +959,7 @@ window.addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); throwFromCamera(); }
   if (e.code === 'Delete' || e.code === 'Backspace') {         // remove the item being carried, or the one under the pointer
     e.preventDefault();
-    const it = mouseHand.held || itemAtPointer();
-    if (it && it.spawned) removeItem(it);
+    removeAtPointer();
   }
 });
 window.addEventListener('keyup', e => keys.delete(e.code));
@@ -822,16 +975,32 @@ function mouseDrop() {
   const f = viewDirection(tmpA);
   releaseItem(it, it.kind === 'ball' ? f.multiplyScalar(4.5).add(tmpB.set(0, 1.2, 0)) : f.set(0, 0, 0));
 }
-function itemAtPointer() {
+function itemAtPointer() {                  // the ball or item the pointer is over
   rig.updateMatrixWorld(true); camera.updateMatrixWorld(true);
   picker.setFromCamera(ndc, camera);
+  const wall = room.raycast(picker.ray.origin, picker.ray.direction, 6), limit = wall > 0 ? wall + 0.15 : 6;
   let best = null, bestT = Infinity;
-  for (const it of items) {
-    if (it.heldBy) continue;
+  for (const it of items) {                 // first: exactly what is under the pointer
+    if (it.heldBy || it.gone) continue;
+    const hits = picker.intersectObject(it.mesh, true);
+    if (hits.length && hits[0].distance < bestT && hits[0].distance < limit) { bestT = hits[0].distance; best = it; }
+  }
+  if (best) return best;
+  for (const it of items) {                 // otherwise: a near miss still counts, which helps with small things
+    if (it.heldBy || it.gone) continue;
     const c = itemCenter(it, tmpB), t = tmpC.copy(c).sub(picker.ray.origin).dot(picker.ray.direction);
-    if (t > 0 && t < 5 && t < bestT && picker.ray.distanceSqToPoint(c) < (it.pick * 0.8) ** 2) { bestT = t; best = it; }
+    const reach = it.kind === 'ball' ? 0.08 : Math.min(0.1, it.pick * 0.5);
+    if (t > 0 && t < limit && t < bestT && picker.ray.distanceSqToPoint(c) < reach * reach) { bestT = t; best = it; }
   }
   return best;
+}
+const hoverBox = new THREE.BoxHelper(new THREE.Object3D(), 0x7df9ff);     // outlines what a click or Delete will act on
+hoverBox.material.depthTest = false; hoverBox.material.transparent = true; hoverBox.renderOrder = 950; hoverBox.visible = false;
+scene.add(hoverBox);
+function removeAtPointer() {
+  const it = mouseHand.held || itemAtPointer();
+  if (it) removeItem(it);
+  return !!it;
 }
 function clickAt(x, y) {
   ndc.set(x / window.innerWidth * 2 - 1, -(y / window.innerHeight) * 2 + 1);
@@ -850,7 +1019,7 @@ function rayToItemTop(self, o, d) {         // distance along a line of sight to
   return best;
 }
 function throwFromCamera() {
-  const pool = items.filter(i => i.kind === 'ball' && !i.heldBy);
+  const pool = items.filter(i => i.kind === 'ball' && !i.heldBy && !i.gone);
   const b = pool[nextBall++ % Math.max(1, pool.length)]; if (!b) return;
   const f = viewDirection(tmpA);
   headPosition(b.mesh.position).addScaledVector(f, 0.3);
@@ -868,6 +1037,9 @@ function updateDesktop(dt) {
     tryMove((f.x * fwd - f.z * side) * step, (f.z * fwd + f.x * side) * step);
   }
   const it = mouseHand.held;
+  const hover = it ? null : itemAtPointer();
+  hoverBox.visible = !!hover;
+  if (hover) hoverBox.setFromObject(hover.mesh);
   if (it) {
     rig.updateMatrixWorld(true); camera.updateMatrixWorld(true);
     const m = it.mesh;
@@ -916,12 +1088,12 @@ async function setUpVR() {
   renderer.xr.setFoveation(1);
   const button = $('enter');
   button.hidden = false;
-  $('keys').textContent = 'The controls are on a small panel above your left controller.';
+  $('keys').textContent = 'With controllers, the controls are on a small panel above the left one. With your hands, raise your left hand to see a menu.';
   let session = null;
   button.addEventListener('click', async () => {
     if (session) { session.end(); return; }
     try {
-      session = await navigator.xr.requestSession('immersive-vr', { requiredFeatures: ['local-floor'] });
+      session = await navigator.xr.requestSession('immersive-vr', { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking'] });
       session.addEventListener('end', () => {
         session = null; button.textContent = 'Enter VR'; $('hud').style.display = '';
         endTeleport(false);
@@ -1005,7 +1177,7 @@ renderer.setAnimationLoop(() => {
   }
 })();
 
-window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, items, balls: items, hands, renderer, scene, toggleView, resetItems, resetBalls: resetItems, spawnItem, releaseItem, removeItem, supportUnder, wakeAbove, mouseTake, itemAtPointer, clickAt, mouseHand, CATALOG, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
+window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, items, balls: items, hands, renderer, scene, toggleView, resetItems, resetBalls: resetItems, spawnItem, releaseItem, removeItem, removeAtPointer, hoverBox, makeHand, updateHandTracking, handMenu, MENU, supportUnder, wakeAbove, mouseTake, itemAtPointer, clickAt, mouseHand, CATALOG, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
 </script>
 </body>
 </html>

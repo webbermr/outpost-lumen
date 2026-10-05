@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scanned room</title>
+<meta name="description" content="Walk around a scanned room in VR.">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b10; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  #hud {
+    position: fixed; z-index: 5;
+    left: calc(20px + env(safe-area-inset-left, 0px));
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    max-width: min(27rem, calc(100vw - 40px));
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+    color: #f1efe9; text-shadow: 0 1px 10px rgba(0, 0, 0, .9);
+    pointer-events: none;
+  }
+  #hud h1 { margin: 0 0 .3rem; font-size: 1.4rem; font-weight: 600; }
+  #hud p { margin: 0 0 .5rem; font-size: .95rem; line-height: 1.45; color: #cfcabd; }
+  #enter {
+    pointer-events: auto; cursor: pointer; margin: .2rem 0 .6rem;
+    font: 600 1.05rem "Avenir Next", "Segoe UI", system-ui, sans-serif;
+    padding: .7rem 1.4rem; border-radius: .6rem; border: 2px solid #f1efe9;
+    background: rgba(20, 20, 28, .75); color: #f1efe9;
+  }
+  #enter:hover, #enter:focus-visible { background: #f1efe9; color: #14141c; outline: none; }
+  #enter[hidden] { display: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+    "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.3.1/dist/spark.module.min.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">
+  <h1>Scanned room</h1>
+  <p id="status">Loading the room…</p>
+  <button id="enter" hidden>Enter VR</button>
+  <p id="keys">Drag to look. W, A, S and D walk. M switches between the splat and the mesh. Space throws a ball.</p>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+/* ------------------------------------------------------------------
+   Settings. To use a different scan, change the two file names, or add
+   them to the address:  room.html?mesh=kitchen.glb&splat=kitchen.spz
+   Other address options:  ?splat=0  (mesh only)   ?res=0.5  (smoother)   ?res=1  (sharper)   ?detail=0.6  (fewer splats, faster)
+   ------------------------------------------------------------------ */
+const params = new URLSearchParams(location.search);
+const CONFIG = {
+  mesh: params.get('mesh') || 'work_1.glb',
+  splat: params.get('splat') === '0' ? null : (params.get('splat') || 'work_1.spz'),
+  resolution: Math.min(1.5, Math.max(0.3, parseFloat(params.get('res')) || 0.6)),
+  detail: Math.min(4, Math.max(0.05, parseFloat(params.get('detail')) || 1)),   // splat budget multiplier
+  voxel: 0.05,          // size of the collision cells, metres
+  eyeHeight: 1.6,       // desktop preview only; in VR your real height is used
+  walkSpeed: 1.3,       // metres per second
+  playerRadius: 0.15,   // how close you can get to walls and furniture
+  ballCount: 5,
+  ballRadius: 0.045
+};
+
+const $ = id => document.getElementById(id);
+const setStatus = msg => { $('status').textContent = msg; };
+const V3 = THREE.Vector3;
+
+/* ---------- renderer, scene, viewer rig ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0b10);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8478, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(1, 3, 2); scene.add(sun);
+
+const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.05, 300);
+camera.rotation.order = 'YXZ';
+const rig = new THREE.Group();          // move this to move the viewer
+rig.add(camera);
+scene.add(rig);
+
+window.addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ---------- collision: turn the mesh into a grid of small cells ---------- */
+function buildRoom(root) {
+  const cell = CONFIG.voxel;
+  const box = new THREE.Box3().setFromObject(root);
+  const min = box.min.clone().subScalar(cell * 2);
+  const nx = Math.ceil((box.max.x - min.x) / cell) + 2;
+  const ny = Math.ceil((box.max.y - min.y) / cell) + 2;
+  const nz = Math.ceil((box.max.z - min.z) / cell) + 2;
+  const occ = new Uint8Array(nx * ny * nz);            // bit 1: surface here, bit 2: surface faces up
+  const I = (x, y, z) => (y * nz + z) * nx + x;
+  const ix = x => Math.floor((x - min.x) / cell), iy = y => Math.floor((y - min.y) / cell), iz = z => Math.floor((z - min.z) / cell);
+
+  const BIN = 0.04, hist = new Float32Array(Math.ceil((box.max.y - box.min.y) / BIN) + 2);
+  const a = new V3(), b = new V3(), c = new V3(), ab = new V3(), ac = new V3(), n = new V3();
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position, index = o.geometry.index;
+    const tris = (index ? index.count : pos.count) / 3;
+    for (let t = 0; t < tris; t++) {
+      const i0 = index ? index.getX(t * 3) : t * 3, i1 = index ? index.getX(t * 3 + 1) : t * 3 + 1, i2 = index ? index.getX(t * 3 + 2) : t * 3 + 2;
+      a.fromBufferAttribute(pos, i0).applyMatrix4(o.matrixWorld);
+      b.fromBufferAttribute(pos, i1).applyMatrix4(o.matrixWorld);
+      c.fromBufferAttribute(pos, i2).applyMatrix4(o.matrixWorld);
+      ab.subVectors(b, a); ac.subVectors(c, a); n.crossVectors(ab, ac);
+      const area = n.length() * 0.5;
+      if (area < 1e-10) continue;
+      n.normalize();
+      const up = n.y > 0.8, flag = up ? 3 : 1;
+      if (up) hist[Math.floor(((a.y + b.y + c.y) / 3 - box.min.y) / BIN)] += area;
+      const steps = Math.max(1, Math.ceil(Math.max(ab.length(), ac.length(), b.distanceTo(c)) / (cell * 0.5)));
+      for (let i = 0; i <= steps; i++) for (let j = 0; j <= steps - i; j++) {
+        const u = i / steps, v = j / steps;
+        const X = ix(a.x + ab.x * u + ac.x * v), Y = iy(a.y + ab.y * u + ac.y * v), Z = iz(a.z + ab.z * u + ac.z * v);
+        if (X >= 0 && X < nx && Y >= 0 && Y < ny && Z >= 0 && Z < nz) occ[I(X, Y, Z)] |= flag;
+      }
+    }
+  });
+
+  /* the floor is the biggest flat, upward-facing area in the lower part of the scan */
+  let best = 0, bestBin = 0;
+  const lowBins = Math.max(3, Math.floor(hist.length * 0.35));
+  for (let i = 0; i < lowBins; i++) if (hist[i] > best) { best = hist[i]; bestBin = i; }
+  let wsum = 0, ysum = 0;
+  for (let i = Math.max(0, bestBin - 1); i <= bestBin + 1; i++) { wsum += hist[i]; ysum += hist[i] * (box.min.y + (i + 0.5) * BIN); }
+  const floorY = wsum > 0 ? ysum / wsum : box.min.y;
+
+  /* flatten to a floor plan */
+  const N2 = nx * nz, J = (x, z) => z * nx + x;
+  /* cover: the scan has a floor or ceiling here.  body: something is in the way between shin and head height. */
+  const cover = new Uint8Array(N2), body = new Uint8Array(N2), tall = new Uint8Array(N2);
+  const clampY = y => Math.min(ny, Math.max(0, y));
+  const yB0 = clampY(iy(floorY + 0.30)), yB1 = clampY(iy(floorY + 1.75));
+  const yT0 = clampY(iy(floorY + 1.1)), yT1 = clampY(iy(floorY + 1.9));
+  for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
+    const j = J(x, z);
+    for (let y = 0; y < ny; y++) {
+      if (!occ[I(x, y, z)]) continue;
+      if (y >= yB0 && y < yB1) body[j] = 1; else cover[j] = 1;
+      if (y >= yT0 && y < yT1) tall[j] = 1;
+    }
+  }
+  const morph = (src, r, grow) => {          // grow or shrink a mask by r cells
+    const out = new Uint8Array(N2);
+    for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
+      let hit = grow ? 0 : 1;
+      for (let dz = -r; dz <= r && (grow ? !hit : hit); dz++) for (let dx = -r; dx <= r; dx++) {
+        const X = x + dx, Z = z + dz, v = (X >= 0 && X < nx && Z >= 0 && Z < nz) ? src[J(X, Z)] : 0;
+        if (grow ? v : !v) { hit = grow ? 1 : 0; break; }
+      }
+      out[J(x, z)] = hit;
+    }
+    return out;
+  };
+  let open = new Uint8Array(N2);
+  for (let j = 0; j < N2; j++) open[j] = cover[j] && !body[j] ? 1 : 0;
+  open = morph(morph(open, 2, true), 2, false);          // close pinholes in the scanned floor
+  for (let j = 0; j < N2; j++) if (body[j]) open[j] = 0;
+
+  const chamfer = (isSource) => {           // distance (in cells) to the nearest source cell
+    const d = new Float32Array(N2).fill(1e6), D = 1.414;
+    for (let j = 0; j < N2; j++) if (isSource(j)) d[j] = 0;
+    for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
+      const j = J(x, z); let v = d[j];
+      if (x > 0) v = Math.min(v, d[j - 1] + 1);
+      if (z > 0) { v = Math.min(v, d[j - nx] + 1); if (x > 0) v = Math.min(v, d[j - nx - 1] + D); if (x < nx - 1) v = Math.min(v, d[j - nx + 1] + D); }
+      d[j] = v;
+    }
+    for (let z = nz - 1; z >= 0; z--) for (let x = nx - 1; x >= 0; x--) {
+      const j = J(x, z); let v = d[j];
+      if (x < nx - 1) v = Math.min(v, d[j + 1] + 1);
+      if (z < nz - 1) { v = Math.min(v, d[j + nx] + 1); if (x < nx - 1) v = Math.min(v, d[j + nx + 1] + D); if (x > 0) v = Math.min(v, d[j + nx - 1] + D); }
+      d[j] = v;
+    }
+    return d;
+  };
+  const flood = (mask, seed, out, label) => {
+    let count = 0; const stack = [seed]; out[seed] = label;
+    while (stack.length) {
+      const j = stack.pop(); count++;
+      const x = j % nx, z = (j - x) / nx;
+      if (x > 0 && mask[j - 1] && !out[j - 1]) { out[j - 1] = label; stack.push(j - 1); }
+      if (x < nx - 1 && mask[j + 1] && !out[j + 1]) { out[j + 1] = label; stack.push(j + 1); }
+      if (z > 0 && mask[j - nx] && !out[j - nx]) { out[j - nx] = label; stack.push(j - nx); }
+      if (z < nz - 1 && mask[j + nx] && !out[j + nx]) { out[j + nx] = label; stack.push(j + nx); }
+    }
+    return count;
+  };
+
+  /* where you may stand: open floor, a body-width away from anything, in one connected piece */
+  const clearance = chamfer(j => !open[j]);
+  const R = CONFIG.playerRadius / cell;
+  const roomy = new Uint8Array(N2);
+  for (let j = 0; j < N2; j++) roomy[j] = clearance[j] >= R ? 1 : 0;
+  const labels = new Int32Array(N2); let mainLabel = 0, mainSize = 0, next = 1;
+  for (let j = 0; j < N2; j++) if (roomy[j] && !labels[j]) { const size = flood(roomy, j, labels, next); if (size > mainSize) { mainSize = size; mainLabel = next; } next++; }
+  const walk = new Uint8Array(N2);
+  let startJ = -1, startD = -1;
+  for (let j = 0; j < N2; j++) if (mainLabel && labels[j] === mainLabel) { walk[j] = 1; if (clearance[j] > startD) { startD = clearance[j]; startJ = j; } }
+  const hasFloor = startJ >= 0;
+  if (!hasFloor) startJ = J(Math.floor(nx / 2), Math.floor(nz / 2));
+  const cxw = x => min.x + (x + 0.5) * cell, czw = z => min.z + (z + 0.5) * cell;
+  const sx = startJ % nx, sz = (startJ - sx) / nx;
+  const start = new V3(cxw(sx), floorY, czw(sz));
+
+  /* face the longest clear run of floor */
+  let startYaw = 0, bestRun = -1;
+  for (let k = 0; k < 24; k++) {
+    const ang = k / 24 * Math.PI * 2, dx = Math.sin(ang), dz = Math.cos(ang); let run = 0;
+    for (; run < 400; run++) {
+      const X = Math.round(sx + dx * run), Z = Math.round(sz + dz * run);
+      if (X < 0 || X >= nx || Z < 0 || Z >= nz || !walk[J(X, Z)]) break;
+    }
+    if (run > bestRun) { bestRun = run; startYaw = Math.atan2(-dx, -dz); }
+  }
+
+  /* the room at head height, used to notice when your head goes through a wall */
+  const headFree = new Uint8Array(N2), headOK = new Uint8Array(N2);
+  for (let j = 0; j < N2; j++) headFree[j] = tall[j] ? 0 : 1;
+  if (headFree[startJ]) flood(headFree, startJ, headOK, 1); else headOK.fill(1);
+
+  /* flat, clear, reachable surfaces at table height: places to put things */
+  const toWalk = chamfer(j => walk[j] === 1);
+  const yS0 = clampY(iy(floorY + 0.55)), yS1 = clampY(iy(floorY + 1.05));
+  const top = new Int16Array(N2).fill(-1);
+  for (let z = 0; z < nz; z++) for (let x = 0; x < nx; x++) {
+    for (let y = yS1 - 1; y >= yS0; y--) if (occ[I(x, y, z)] & 2) {
+      let clear = true;
+      for (let k = 1; k <= 6 && y + k < ny; k++) if (occ[I(x, y + k, z)]) { clear = false; break; }
+      if (clear) top[J(x, z)] = y;
+      break;
+    }
+  }
+  const cand = [];
+  for (let z = 1; z < nz - 1; z++) for (let x = 1; x < nx - 1; x++) {
+    const j = J(x, z), y = top[j];
+    if (y < 0 || toWalk[j] * cell > 0.6) continue;
+    let flat = true;
+    for (let dz = -1; dz <= 1 && flat; dz++) for (let dx = -1; dx <= 1; dx++) { const t = top[J(x + dx, z + dz)]; if (t < 0 || Math.abs(t - y) > 1) { flat = false; break; } }
+    if (flat) cand.push({ x, z, y, d: toWalk[j] });
+  }
+  cand.sort((p, q) => p.d - q.d);
+  const spots = [];
+  for (const p of cand) {
+    if (spots.length >= CONFIG.ballCount) break;
+    if (spots.every(s => Math.hypot(s.cx - p.x, s.cz - p.z) >= 5)) spots.push({ cx: p.x, cz: p.z, pos: new V3(cxw(p.x), min.y + (p.y + 1) * cell + CONFIG.ballRadius + 0.01, czw(p.z)), resting: true });
+  }
+  for (let k = 0; spots.length < CONFIG.ballCount; k++) {      // not enough table: float the rest near the start
+    const ang = startYaw + (k - 2) * 0.5;
+    spots.push({ cx: -99, cz: -99, pos: new V3(start.x - Math.sin(ang) * 0.5, floorY + 1.15, start.z - Math.cos(ang) * 0.5), resting: false });
+  }
+
+  const inGrid = (X, Y, Z) => X >= 0 && X < nx && Y >= 0 && Y < ny && Z >= 0 && Z < nz;
+  return {
+    box, min, cell, nx, ny, nz, floorY, start, startYaw, spots, hasFloor,
+    walkArea: mainSize * cell * cell,
+    map() {                                  // text floor plan, handy when checking a new scan in the browser console
+      let out = '';
+      for (let z = 0; z < nz; z++) { for (let x = 0; x < nx; x++) { const j = J(x, z); out += j === startJ ? 'S' : walk[j] ? '.' : body[j] ? '#' : top[j] >= 0 ? 't' : ' '; } out += '\n'; }
+      return out;
+    },
+    solid(x, y, z) {                       // is there scanned surface here? (the floor counts everywhere)
+      if (y < floorY) return true;
+      const X = ix(x), Y = iy(y), Z = iz(z);
+      return inGrid(X, Y, Z) && occ[I(X, Y, Z)] !== 0;
+    },
+    canStand(x, z) { const X = ix(x), Z = iz(z); return X >= 0 && X < nx && Z >= 0 && Z < nz && walk[J(X, Z)] === 1; },
+    headInRoom(x, z) { const X = ix(x), Z = iz(z); return !(X >= 0 && X < nx && Z >= 0 && Z < nz) ? false : headOK[J(X, Z)] === 1; },
+    outOfBounds(p) { return p.x < min.x - 1 || p.x > box.max.x + 1 || p.z < min.z - 1 || p.z > box.max.z + 1 || p.y > box.max.y + 3 || p.y < floorY - 0.5; }
+  };
+}
+
+/* ---------- state ---------- */
+let room = null, meshRoot = null, splat = null, splatReady = false, showSplat = true, settleFrames = 0;
+const balls = [];
+const tmpA = new V3(), tmpB = new V3(), tmpC = new V3(), tmpQ = new THREE.Quaternion();
+
+function applyView() {
+  const useSplat = showSplat && splatReady;
+  if (splat) splat.visible = useSplat;
+  if (meshRoot) meshRoot.visible = !useSplat;
+}
+function toggleView() { showSplat = !showSplat; applyView(); }
+
+/* ---------- balls ---------- */
+const BALL_COLORS = [0xff5a4f, 0xffc93c, 0x3ccf91, 0x4aa8ff, 0xc77dff];
+function makeBalls() {
+  const geo = new THREE.IcosahedronGeometry(CONFIG.ballRadius, 2);
+  room.spots.forEach((spot, i) => {
+    const color = BALL_COLORS[i % BALL_COLORS.length];
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color, roughness: 0.45, emissive: color, emissiveIntensity: 0.25 }));
+    mesh.position.copy(spot.pos);
+    scene.add(mesh);
+    balls.push({ mesh, home: spot.pos.clone(), vel: new V3(), moving: false, heldBy: null, quiet: 0 });
+  });
+}
+function resetBalls() {
+  for (const b of balls) {
+    if (b.heldBy) { b.heldBy.held = null; b.heldBy = null; scene.attach(b.mesh); }
+    b.mesh.position.copy(b.home); b.vel.set(0, 0, 0); b.moving = false; b.quiet = 0;
+  }
+}
+function updateBalls(dt) {
+  const r = CONFIG.ballRadius;
+  for (const b of balls) {
+    if (b.heldBy || !b.moving) continue;
+    const p = b.mesh.position, v = b.vel;
+    v.y -= 9.8 * dt;
+    const n = Math.min(12, Math.max(1, Math.ceil(v.length() * dt / 0.02)));
+    const h = dt / n;
+    let grounded = false;
+    for (let s = 0; s < n; s++) {
+      p.x += v.x * h;
+      if (room.solid(p.x + Math.sign(v.x) * r, p.y, p.z)) { p.x -= v.x * h; v.x *= -0.55; }
+      p.z += v.z * h;
+      if (room.solid(p.x, p.y, p.z + Math.sign(v.z) * r)) { p.z -= v.z * h; v.z *= -0.55; }
+      p.y += v.y * h;
+      if (room.solid(p.x, p.y + Math.sign(v.y) * r, p.z)) {
+        p.y -= v.y * h;
+        if (v.y < 0) { grounded = true; v.x *= 0.9; v.z *= 0.9; }
+        v.y *= -0.5;
+        if (Math.abs(v.y) < 0.35) v.y = 0;
+      }
+    }
+    if (grounded && v.lengthSq() < 0.01) { b.quiet += dt; if (b.quiet > 0.4) { b.moving = false; v.set(0, 0, 0); } } else b.quiet = 0;
+    if (room.outOfBounds(p)) { p.copy(b.home); v.set(0, 0, 0); b.moving = false; }
+  }
+}
+
+/* ---------- moving the viewer ---------- */
+function headPosition(out) { return camera.getWorldPosition(out); }
+function headForward(out) {
+  camera.getWorldQuaternion(tmpQ);
+  out.set(0, 0, -1).applyQuaternion(tmpQ); out.y = 0;
+  if (out.lengthSq() < 1e-5) out.set(0, 0, -1);
+  return out.normalize();
+}
+function tryMove(dx, dz) {                 // slide along walls and furniture instead of passing through
+  const h = headPosition(tmpC);
+  if (!room.hasFloor || !room.canStand(h.x, h.z) || room.canStand(h.x + dx, h.z + dz)) { rig.position.x += dx; rig.position.z += dz; }
+  else if (room.canStand(h.x + dx, h.z)) rig.position.x += dx;
+  else if (room.canStand(h.x, h.z + dz)) rig.position.z += dz;
+}
+function placeHeadAt(x, z) {
+  rig.updateMatrixWorld(true);
+  const h = headPosition(tmpC);
+  rig.position.x += x - h.x; rig.position.z += z - h.z; rig.position.y = room.floorY;
+}
+function snapTurn(angle) {
+  rig.updateMatrixWorld(true);
+  const before = headPosition(tmpA).clone();
+  rig.rotation.y += angle;
+  rig.updateMatrixWorld(true);
+  const after = headPosition(tmpB);
+  rig.position.x += before.x - after.x; rig.position.z += before.z - after.z;
+}
+
+/* ---------- teleport arc ---------- */
+const ARC_N = 48;
+const arcGeo = new THREE.BufferGeometry();
+arcGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ARC_N * 3), 3));
+const arc = new THREE.Line(arcGeo, new THREE.LineBasicMaterial({ color: 0x7df9ff, transparent: true, depthTest: false }));
+arc.frustumCulled = false; arc.visible = false; arc.renderOrder = 900; scene.add(arc);
+const reticleGeo = new THREE.RingGeometry(0.17, 0.23, 32); reticleGeo.rotateX(-Math.PI / 2);
+const reticle = new THREE.Mesh(reticleGeo, new THREE.MeshBasicMaterial({ color: 0x7df9ff, transparent: true, opacity: 0.95, depthTest: false, side: THREE.DoubleSide }));
+reticle.visible = false; reticle.renderOrder = 901; scene.add(reticle);
+const teleport = { aiming: false, valid: false, target: new V3() };
+
+function updateArc(origin, dir) {
+  const pts = arcGeo.attributes.position.array;
+  let px = origin.x, py = origin.y, pz = origin.z;
+  let vx = dir.x * 6, vy = dir.y * 6, vz = dir.z * 6;
+  const h = 0.03; let n = 0, valid = false;
+  for (let i = 0; i < ARC_N; i++) {
+    pts[i * 3] = px; pts[i * 3 + 1] = py; pts[i * 3 + 2] = pz; n = i + 1;
+    if (i > 0) {
+      if (py <= room.floorY) { pts[i * 3 + 1] = py = room.floorY; valid = room.canStand(px, pz); break; }
+      if (py > room.floorY + 0.3 && room.solid(px, py, pz)) break;       // hit a wall or furniture
+    }
+    px += vx * h; py += vy * h; pz += vz * h; vy -= 9.8 * h;
+  }
+  arcGeo.setDrawRange(0, n); arcGeo.attributes.position.needsUpdate = true;
+  arc.material.color.setHex(valid ? 0x7df9ff : 0xff6b6b);
+  arc.visible = true;
+  teleport.valid = valid; reticle.visible = valid;
+  if (valid) { teleport.target.set(px, room.floorY, pz); reticle.position.set(px, room.floorY + 0.02, pz); }
+}
+function endTeleport(go) {
+  if (go && teleport.aiming && teleport.valid) placeHeadAt(teleport.target.x, teleport.target.z);
+  teleport.aiming = false; teleport.valid = false; arc.visible = false; reticle.visible = false;
+}
+
+/* ---------- VR controllers ---------- */
+const hands = { left: null, right: null };
+const controllerModels = new XRControllerModelFactory();
+function makeWristPanel() {
+  const W = 640, H = 400, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#14141c'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = '#7df9ff'; g.lineWidth = 4; g.strokeRect(6, 6, W - 12, H - 12);
+  const font = '"Avenir Next", "Segoe UI", system-ui, sans-serif';
+  const rows = [['Left stick', 'Walk'], ['Right stick', 'Turn'], ['Right trigger', 'Teleport'], ['Grip', 'Grab a ball'], ['A', 'Splat or mesh'], ['X', 'Reset balls']];
+  rows.forEach((row, i) => {
+    const y = 66 + i * 58;
+    g.font = '600 34px ' + font; g.fillStyle = '#7df9ff'; g.fillText(row[0], 30, y);
+    g.font = '34px ' + font; g.fillStyle = '#f1efe9'; g.fillText(row[1], 290, y);
+  });
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.1), new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide }));
+  panel.position.set(0, 0.1, 0.02); panel.rotation.x = -0.75;      // floats just above the left controller, tilted toward you
+  return panel;
+}
+const wristPanel = makeWristPanel();
+
+for (let i = 0; i < 2; i++) {
+  const ray = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i);
+  grip.add(controllerModels.createControllerModel(grip));
+  rig.add(ray, grip);
+  const hand = { ray, grip, gamepad: null, side: null, was: {}, held: null, vel: new V3(), last: new V3(), tracked: false, turnLatch: false };
+  ray.addEventListener('connected', e => {
+    const src = e.data;
+    if (!src || (src.handedness !== 'left' && src.handedness !== 'right')) return;
+    hand.side = src.handedness; hand.gamepad = src.gamepad || null; hand.tracked = false; hands[hand.side] = hand;
+    if (hand.side === 'left') grip.add(wristPanel);
+  });
+  ray.addEventListener('disconnected', () => {
+    if (hand.held) dropBall(hand, false);
+    if (hand.side && hands[hand.side] === hand) hands[hand.side] = null;
+    hand.gamepad = null; hand.side = null;
+  });
+}
+function pad(hand) {
+  const gp = hand && hand.gamepad;
+  if (!gp) return null;
+  const down = i => !!(gp.buttons[i] && gp.buttons[i].pressed);
+  return { trigger: down(0), grip: down(1), primary: down(4), x: gp.axes[2] || 0, y: gp.axes[3] || 0 };
+}
+function buzz(hand, strength, ms) { try { hand.gamepad.hapticActuators[0].pulse(strength, ms); } catch (e) { /* no haptics */ } }
+
+function grabBall(hand) {
+  if (hand.held) return;
+  const hp = hand.grip.getWorldPosition(tmpA);
+  let best = null, bestD = 0.22;                       // reach, metres
+  for (const b of balls) {
+    if (b.heldBy) continue;
+    const d = b.mesh.getWorldPosition(tmpB).distanceTo(hp);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  if (!best) return;
+  hand.grip.attach(best.mesh);
+  best.heldBy = hand; best.moving = false; hand.held = best;
+  buzz(hand, 0.6, 40);
+}
+function dropBall(hand, thrown) {
+  const b = hand.held; if (!b) return;
+  scene.attach(b.mesh);
+  b.heldBy = null; hand.held = null;
+  b.vel.copy(thrown ? hand.vel : tmpA.set(0, 0, 0)); b.moving = true; b.quiet = 0;
+}
+
+function updateVR(dt) {
+  rig.position.y = room.floorY;
+  if (settleFrames > 0 && --settleFrames === 0) placeHeadAt(room.start.x, room.start.z);   // wherever you stand in your real room, start in the clear
+  const L = hands.left, R = hands.right, lp = pad(L), rp = pad(R);
+
+  for (const hand of [L, R]) {                           // hand speed, for throwing
+    if (!hand) continue;
+    const p = hand.grip.getWorldPosition(tmpA);
+    if (hand.tracked) { tmpB.copy(p).sub(hand.last).divideScalar(dt); hand.vel.lerp(tmpB, 0.5); }
+    hand.last.copy(p); hand.tracked = true;
+  }
+
+  if (lp) {
+    if (Math.abs(lp.x) > 0.15 || Math.abs(lp.y) > 0.15) {
+      const f = headForward(tmpA), step = CONFIG.walkSpeed * dt;
+      tryMove((f.x * -lp.y - f.z * lp.x) * step, (f.z * -lp.y + f.x * lp.x) * step);
+    }
+    if (lp.grip && !L.was.grip) grabBall(L);
+    if (!lp.grip && L.was.grip) dropBall(L, true);
+    if (lp.primary && !L.was.primary) resetBalls();
+    L.was = lp;
+  }
+  if (rp) {
+    if (Math.abs(rp.x) < 0.3) R.turnLatch = false;
+    else if (!R.turnLatch && Math.abs(rp.x) > 0.7) { R.turnLatch = true; snapTurn((rp.x > 0 ? -1 : 1) * Math.PI / 6); }
+    if (rp.grip && !R.was.grip) grabBall(R);
+    if (!rp.grip && R.was.grip) dropBall(R, true);
+    if (rp.primary && !R.was.primary) toggleView();
+    if (rp.trigger && !R.was.trigger) teleport.aiming = true;
+    if (!rp.trigger && R.was.trigger) endTeleport(true);
+    if (teleport.aiming) {
+      rig.updateMatrixWorld(true);
+      R.ray.getWorldPosition(tmpA); R.ray.getWorldQuaternion(tmpQ);
+      updateArc(tmpA, tmpB.set(0, 0, -1).applyQuaternion(tmpQ));
+    }
+    R.was = rp;
+  } else if (teleport.aiming) endTeleport(false);
+}
+
+/* ---------- desktop preview ---------- */
+const keys = new Set();
+let yaw = 0, pitch = 0, dragging = false, nextBall = 0;
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; renderer.domElement.setPointerCapture(e.pointerId); });
+renderer.domElement.addEventListener('pointerup', () => { dragging = false; });
+renderer.domElement.addEventListener('pointermove', e => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  yaw -= e.movementX * 0.004; pitch = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * 0.004));
+});
+window.addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (!room || renderer.xr.isPresenting) return;
+  if (e.code === 'KeyM') toggleView();
+  if (e.code === 'KeyR') resetBalls();
+  if (e.code === 'Space') { e.preventDefault(); throwFromCamera(); }
+});
+window.addEventListener('keyup', e => keys.delete(e.code));
+function throwFromCamera() {
+  const b = balls[nextBall++ % balls.length]; if (!b || b.heldBy) return;
+  camera.getWorldQuaternion(tmpQ);
+  const f = tmpA.set(0, 0, -1).applyQuaternion(tmpQ);
+  headPosition(b.mesh.position).addScaledVector(f, 0.3);
+  b.vel.copy(f).multiplyScalar(4.5); b.vel.y += 1.2; b.moving = true; b.quiet = 0;
+}
+function updateDesktop(dt) {
+  camera.position.set(0, CONFIG.eyeHeight, 0);
+  camera.rotation.set(pitch, yaw, 0);
+  rig.position.y = room.floorY;
+  const fwd = (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0) - (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0);
+  const side = (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+  if (fwd || side) {
+    rig.updateMatrixWorld(true);
+    const f = headForward(tmpA), step = CONFIG.walkSpeed * dt;
+    tryMove((f.x * fwd - f.z * side) * step, (f.z * fwd + f.x * side) * step);
+  }
+}
+
+/* ---------- fade to black when your head leaves the room ---------- */
+const fade = new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0x000000, side: THREE.BackSide, transparent: true, opacity: 0, depthTest: false, depthWrite: false }));
+fade.renderOrder = 1000; fade.visible = false; fade.frustumCulled = false;
+camera.add(fade);
+function updateFade(dt, inVR) {
+  let want = 0;
+  if (inVR && room.hasFloor) { const h = headPosition(tmpC); if (!room.headInRoom(h.x, h.z)) want = 0.92; }
+  const m = fade.material;
+  m.opacity += (want - m.opacity) * Math.min(1, dt * 8);
+  fade.visible = m.opacity > 0.01;
+}
+
+/* ---------- entering VR ---------- */
+async function setUpVR() {
+  if (!navigator.xr || !navigator.xr.isSessionSupported) return;
+  let ok = false;
+  try { ok = await navigator.xr.isSessionSupported('immersive-vr'); } catch (e) { ok = false; }
+  if (!ok) return;
+  renderer.xr.enabled = true;
+  renderer.xr.setReferenceSpaceType('local-floor');
+  renderer.xr.setFramebufferScaleFactor(CONFIG.resolution);
+  renderer.xr.setFoveation(1);
+  const button = $('enter');
+  button.hidden = false;
+  $('keys').textContent = 'The controls are on a small panel above your left controller.';
+  let session = null;
+  button.addEventListener('click', async () => {
+    if (session) { session.end(); return; }
+    try {
+      session = await navigator.xr.requestSession('immersive-vr', { requiredFeatures: ['local-floor'] });
+      session.addEventListener('end', () => {
+        session = null; button.textContent = 'Enter VR'; $('hud').style.display = '';
+        endTeleport(false);
+        if (room) { rig.rotation.y = 0; yaw = room.startYaw; pitch = 0; }
+      });
+      await renderer.xr.setSession(session);
+      button.textContent = 'Exit VR'; $('hud').style.display = 'none';
+      if (room) { rig.rotation.y = room.startYaw; rig.position.set(room.start.x, room.floorY, room.start.z); settleFrames = 3; }
+    } catch (err) {
+      console.error(err); setStatus('Could not start VR: ' + err.message);
+    }
+  });
+}
+
+/* ---------- loading ---------- */
+async function loadMesh() {
+  const gltf = await new GLTFLoader().loadAsync(CONFIG.mesh);
+  meshRoot = gltf.scene;
+  meshRoot.traverse(o => {                    // scans have their lighting baked in, so draw them unlit
+    if (o.isMesh) o.material = new THREE.MeshBasicMaterial({ map: o.material.map || null, color: o.material.map ? 0xffffff : 0x888888, side: THREE.DoubleSide });
+  });
+  scene.add(meshRoot);
+  meshRoot.updateMatrixWorld(true);
+  room = buildRoom(meshRoot);
+  rig.position.set(room.start.x, room.floorY, room.start.z);
+  yaw = room.startYaw;
+  makeBalls();
+  applyView();
+}
+async function loadSplat() {
+  if (!CONFIG.splat) return false;
+  const { SparkRenderer, SplatMesh } = await import('@sparkjsdev/spark');
+  const headset = /OculusBrowser|Quest|Pico|VisionOS/i.test(navigator.userAgent);
+  scene.add(new SparkRenderer({ renderer, lodSplatScale: CONFIG.detail }));
+  splat = new SplatMesh({
+    url: CONFIG.splat,
+    lod: true,                                // lets the renderer draw fewer splats on slower devices
+    onProgress: e => { if (e && e.total) setStatus('Loading the photoreal version… ' + Math.round(100 * e.loaded / e.total) + '%'); }
+  });
+  if (headset) splat.maxSh = 1;                // less view-dependent shading, noticeably cheaper to draw
+  splat.visible = false;
+  scene.add(splat);
+  await splat.initialized;
+  splatReady = true;
+  applyView();
+  return true;
+}
+
+let lastTime = performance.now();
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), dt = Math.min(0.05, Math.max(0.001, (now - lastTime) / 1000));
+  lastTime = now;
+  if (room) {
+    const inVR = renderer.xr.isPresenting;
+    if (inVR) updateVR(dt); else updateDesktop(dt);
+    updateBalls(dt);
+    updateFade(dt, inVR);
+  }
+  renderer.render(scene, camera);
+});
+
+(async () => {
+  setUpVR();
+  try {
+    await loadMesh();
+  } catch (err) {
+    console.error(err);
+    setStatus('Could not load ' + CONFIG.mesh + '. Check that the file is in the same folder as this page.');
+    return;
+  }
+  const size = room.box.getSize(new V3());
+  const about = 'Room loaded: about ' + size.x.toFixed(1) + ' by ' + size.z.toFixed(1) + ' metres.';
+  if (!CONFIG.splat) { setStatus(about + ' Showing the mesh only.'); return; }
+  setStatus(about + ' Loading the photoreal version…');
+  try {
+    await loadSplat();
+    setStatus(about + ' Photoreal version ready.');
+  } catch (err) {
+    console.error(err);
+    setStatus(about + ' The photoreal version did not load, so this is the mesh.');
+  }
+})();
+
+window.__scan = { get room() { return room; }, get splat() { return splat; }, get splatReady() { return splatReady; }, rig, camera, balls, hands, renderer, scene, toggleView, resetBalls, tryMove, placeHeadAt, updateArc, teleport, look(y, p) { yaw = y; pitch = p; }, throwFromCamera };
+</script>
+</body>
+</html>

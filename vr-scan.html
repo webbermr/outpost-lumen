@@ -72,7 +72,7 @@
   <p id="status">Starting up…</p>
   <p id="view">View: Splat (M or X changes it)</p>
   <p id="help">In the headset: left stick walks, right stick turns, trigger or grip grabs and throws. A brings the objects back. X flips the view: splat, splat with the collision wireframe, mesh.</p>
-  <p>Here: drag to look, W A S D to walk, click an object to pick it up and click again to toss it. R, M and H do the same as A, X and hide this panel.</p>
+  <p>Here: drag to look, W A S D to walk, E and Q to raise and lower your view, click an object to pick it up and click again to toss it. R, M and H do the same as A, X and hide this panel.</p>
   <p id="tune" hidden></p>
 </div>
 
@@ -930,6 +930,11 @@ function resetProps() {
 const _head = new THREE.Vector3(), _desired = { x: 0, y: 0, z: 0 };
 
 function stepPlayer(dt) {
+  // Desktop only: E raises and Q lowers your eye height (in VR your real head height is used).
+  if (!renderer.xr.isPresenting) {
+    const lift = (keys.has('KeyE') ? 1 : 0) - (keys.has('KeyQ') ? 1 : 0);
+    if (lift) camera.position.y = THREE.MathUtils.clamp(camera.position.y + lift * 0.9 * dt, 0.15, 2.5);
+  }
   // Thumbstick / keyboard intent, relative to gaze direction.
   camera.getWorldDirection(_dir); _dir.y = 0;
   if (_dir.lengthSq() < 1e-6) _dir.set(0, 0, -1);

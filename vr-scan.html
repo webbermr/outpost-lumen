@@ -70,7 +70,7 @@
 <div id="hud">
   <h1>Scan walkthrough</h1>
   <p id="status">Starting up…</p>
-  <p id="help">In the headset: left stick walks, right stick turns, trigger or grip grabs and throws. A brings the objects back, X shows the collision mesh.</p>
+  <p id="help">In the headset: left stick walks, right stick turns, trigger or grip grabs and throws. A brings the objects back. X flips the view: splat, splat with the collision wireframe, mesh.</p>
   <p>Here: drag to look, W A S D to walk, click an object to pick it up and click again to toss it. R, M and H do the same as A, X and hide this panel.</p>
   <p id="tune" hidden></p>
 </div>
@@ -97,8 +97,8 @@ import RAPIER from '@dimforge/rapier3d-compat';
             └─ colliderPivot ← CONFIG.collider moves only the physics mesh (the .glb)
 
    Rule of thumb: the .glb came from LiDAR, so treat it as the metric truth and
-   nudge the SPLAT until it sits on top of it. Press M (or X on the left
-   controller) to see the collision mesh as a wireframe over the splat.
+   nudge the SPLAT until it sits on top of it. M (or X on the left controller)
+   cycles the view: splat → splat with the collision wireframe → textured mesh.
    With the wireframe showing on desktop you can nudge the splat live:
        I / K  up / down        J / L  left / right (X)     U / O  forward / back (Z)
        [ / ]  scale -/+        , / .  yaw -/+              hold Shift for 5x steps
@@ -293,7 +293,10 @@ applyTransform(splatPivot, CONFIG.splat);
 applyTransform(colliderPivot, CONFIG.collider);
 scanRoot.add(splatPivot, colliderPivot);
 scene.add(scanRoot);
-colliderPivot.visible = false;            // the physics mesh is never drawn (M / X shows it as a debug wireframe)
+colliderPivot.visible = false;            // the physics mesh starts hidden; M / X cycles the view modes below
+const colliderMeshes = [];
+const VIEW = { SPLAT: 0, SPLAT_WIRE: 1, MESH: 2 };   // splat  →  splat + collision wireframe  →  textured mesh only
+let viewMode = VIEW.SPLAT;
 
 const loadNote = (what, url, err) => `Could not load ${what} "${url}" (${err?.message ?? err}). Is the file next to this page? You can point at other names with ?splat=…&mesh=…`;
 
@@ -316,14 +319,19 @@ if (gltfResult.status === 'fulfilled') {
   const wire = new THREE.MeshBasicMaterial({ color: 0x7fe3c4, wireframe: true, transparent: true, opacity: 0.55, depthTest: false });
   model.traverse((o) => {
     if (!o.isMesh) return;
-    for (const m of [].concat(o.material)) {            // textures are never needed; free them
-      for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) {
-        const tex = m[key]; if (tex) { tex.source?.data?.close?.(); tex.dispose(); }
+    const original = [].concat(o.material)[0];
+    const map = original?.map ?? null;                  // keep the colour texture for the mesh view; free the rest
+    for (const m of [].concat(o.material)) {
+      for (const key of ['normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) {
+        const tex = m[key]; if (tex && tex !== map) { tex.source?.data?.close?.(); tex.dispose(); }
       }
       m.dispose();
     }
+    // Scans have their lighting baked into the texture, so the mesh view is drawn unlit.
+    o.userData.meshMaterial = new THREE.MeshBasicMaterial({ map, color: map ? 0xffffff : 0x8a8f98, side: THREE.DoubleSide });
+    o.userData.wireMaterial = wire;
     o.material = wire;
-    o.renderOrder = 999;                                // debug wireframe draws over the splat
+    colliderMeshes.push(o);
   });
   colliderPivot.add(model);
   tri = bakeTriangles(colliderPivot);
@@ -431,7 +439,7 @@ if (splatResult.status === 'fulfilled') {
   notes.push(kept === total ? `${total.toLocaleString()} splats.` : `Showing ${kept.toLocaleString()} of ${total.toLocaleString()} splats.`);
 } else {
   notes.push(loadNote('the splat', CONFIG.files.splat, splatResult.reason));
-  colliderPivot.visible = true;                         // nothing to look at otherwise
+  setViewMode(VIEW.MESH);                               // nothing else to look at
 }
 
 /* How far is the splat's floor from the collider's floor? Looks for the densest
@@ -791,7 +799,7 @@ function updateGrabbers(dt, now) {
    5. INPUT: thumbsticks in VR, mouse and keys on desktop
    ============================================================================
    Left stick walks (relative to where you look). Right stick snap-turns.
-   A (right) brings the objects back in front of you. X (left) toggles the collision wireframe. */
+   A (right) brings the objects back in front of you. X (left) cycles splat / splat + wireframe / mesh. */
 const keys = new Set();
 const input = { moveX: 0, moveZ: 0, snapArmed: true, buttonWas: { reset: false, debug: false } };
 let pitch = -0.45, dragging = false, dragMoved = 0;     // desktop preview starts looking slightly down, at the objects
@@ -968,10 +976,20 @@ function frame(time) {
 /* ============================================================================
    8. DEBUG VIEW AND LIVE ALIGNMENT
    ============================================================================ */
-function toggleColliderView() {
-  colliderPivot.visible = !colliderPivot.visible;
-  $('tune').hidden = !colliderPivot.visible;
+function setViewMode(mode) {
+  viewMode = mode;
+  if (splat) splat.visible = mode !== VIEW.MESH;
+  colliderPivot.visible = mode !== VIEW.SPLAT;
+  for (const o of colliderMeshes) {
+    o.material = mode === VIEW.MESH ? o.userData.meshMaterial : o.userData.wireMaterial;
+    o.renderOrder = mode === VIEW.MESH ? 0 : 999;       // the wireframe draws over the splat; the solid mesh sorts normally
+  }
+  $('tune').hidden = mode !== VIEW.SPLAT_WIRE;
   printTune();
+}
+function toggleColliderView() {                          // M on the keyboard, X on the left controller
+  const order = splat ? [VIEW.SPLAT, VIEW.SPLAT_WIRE, VIEW.MESH] : [VIEW.MESH, VIEW.SPLAT_WIRE];
+  setViewMode(order[(order.indexOf(viewMode) + 1) % order.length]);
 }
 function printTune() {
   const r = (n, d = 3) => +n.toFixed(d), p = splatPivot.position, e = splatPivot.rotation;
@@ -980,7 +998,7 @@ function printTune() {
     `splat: { position: [${r(p.x)}, ${r(p.y)}, ${r(p.z)}], rotationDeg: [${r(e.x / DEG, 2)}, ${r(e.y / DEG, 2)}, ${r(e.z / DEG, 2)}], scale: ${r(splatPivot.scale.x, 4)}, matchFloorToCollider: false }`;
 }
 function tuneKey(e) {
-  if (!colliderPivot.visible || renderer.xr.isPresenting) return;
+  if (viewMode !== VIEW.SPLAT_WIRE || renderer.xr.isPresenting) return;
   const k = e.shiftKey ? 5 : 1, step = 0.01 * k, p = splatPivot.position;
   switch (e.code) {
     case 'KeyI': p.y += step; break;            case 'KeyK': p.y -= step; break;
@@ -994,7 +1012,8 @@ function tuneKey(e) {
   }
   printTune();
 }
-if (CONFIG.collider.showAtStart) toggleColliderView();
+if (Q.get('view') === 'mesh') setViewMode(VIEW.MESH);
+else if (CONFIG.collider.showAtStart) setViewMode(VIEW.SPLAT_WIRE);
 
 /* ============================================================================
    9. VR BUTTON, READY

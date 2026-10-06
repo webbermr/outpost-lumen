@@ -1,0 +1,1020 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scan walkthrough</title>
+<meta name="description" content="Walk around a Gaussian-splat scan in VR, with physics and grabbable objects.">
+<style>
+  :root { --ink: #0c1014; --paper: #e9edf0; --dim: #9aa6ae; --signal: #7fe3c4; --warn: #ffb454; }
+  html, body { margin: 0; height: 100%; background: var(--ink); overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+
+  /* Centered container the standard three.js VRButton is mounted into.
+     VRButton positions itself with inline styles, so these rules use !important to re-seat it. */
+  #vr-ui {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    pointer-events: none;
+  }
+  #vr-ui.docked { align-items: flex-end; justify-content: flex-end; padding: 0 calc(22px + env(safe-area-inset-right, 0px)) calc(22px + env(safe-area-inset-bottom, 0px)) 0; }
+  #vr-ui > * {
+    position: static !important; left: auto !important; bottom: auto !important;
+    width: auto !important; min-width: 9.5rem;
+    pointer-events: auto;
+    padding: .95rem 1.6rem !important;
+    font: 600 1rem/1 "Segoe UI", system-ui, sans-serif !important;
+    letter-spacing: .04em;
+    border: 1.5px solid var(--paper) !important; border-radius: .5rem !important;
+    background: rgba(12, 16, 20, .72) !important; color: var(--paper) !important;
+    opacity: 1 !important;
+  }
+  #vr-ui > button:hover, #vr-ui > button:focus-visible { background: var(--paper) !important; color: var(--ink) !important; outline: none; }
+  #vr-ui.docked > * { font-weight: 500 !important; border-color: rgba(233, 237, 240, .35) !important; color: var(--dim) !important; }
+
+  #hud {
+    position: fixed; z-index: 5; pointer-events: none;
+    left: calc(20px + env(safe-area-inset-left, 0px));
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    max-width: min(30rem, calc(100vw - 40px));
+    font: 400 .92rem/1.5 "Segoe UI", system-ui, sans-serif;
+    color: var(--paper); text-shadow: 0 1px 8px rgba(0, 0, 0, .9);
+  }
+  #hud h1 { margin: 0 0 .25rem; font-size: 1.25rem; font-weight: 600; }
+  #hud p { margin: 0 0 .4rem; color: var(--dim); }
+  #hud #status { color: var(--signal); }
+  #hud #status.error { color: var(--warn); }
+  #hud #tune { font-family: ui-monospace, Consolas, monospace; font-size: .8rem; color: var(--paper); white-space: pre-wrap; }
+  #hud[hidden] { display: none; }
+</style>
+
+<!-- ======================================================================
+     LIBRARIES (public CDN, version-pinned)
+     three r186 ships the native Gaussian splat renderer (GaussianSplat + SPZLoader).
+     It only runs on WebGPURenderer, so "three" must resolve to the WebGPU build.
+     ====================================================================== -->
+<script type="importmap">
+{
+  "imports": {
+    "three":          "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.webgpu.js",
+    "three/webgpu":   "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.webgpu.js",
+    "three/tsl":      "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.tsl.js",
+    "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/",
+    "@dimforge/rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.21.0/dist/rapier.mjs"
+  }
+}
+</script>
+</head>
+<body>
+<div id="vr-ui"></div>
+<div id="hud">
+  <h1>Scan walkthrough</h1>
+  <p id="status">Starting up…</p>
+  <p id="help">In the headset: left stick walks, right stick turns, trigger or grip grabs and throws. A brings the objects back, X shows the collision mesh.</p>
+  <p>Here: drag to look, W A S D to walk, click an object to pick it up and click again to toss it. R, M and H do the same as A, X and hide this panel.</p>
+  <p id="tune" hidden></p>
+</div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { SPZLoader } from 'three/addons/loaders/SPZLoader.js';
+import { GaussianSplat } from 'three/addons/objects/GaussianSplat.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import RAPIER from '@dimforge/rapier3d-compat';
+
+/* ============================================================================
+   0. CONFIG  —  everything you are likely to tweak lives in this block
+   ============================================================================
+   Units are metres and degrees. +Y is up. The finished world has its floor at Y = 0.
+
+   The scene graph for the scans looks like this:
+
+       scene
+        └─ scanRoot        ← CONFIG.world     moves splat AND collider together
+            ├─ splatPivot  ← CONFIG.splat     moves only the picture (the .spz)
+            └─ colliderPivot ← CONFIG.collider moves only the physics mesh (the .glb)
+
+   Rule of thumb: the .glb came from LiDAR, so treat it as the metric truth and
+   nudge the SPLAT until it sits on top of it. Press M (or X on the left
+   controller) to see the collision mesh as a wireframe over the splat.
+   With the wireframe showing on desktop you can nudge the splat live:
+       I / K  up / down        J / L  left / right (X)     U / O  forward / back (Z)
+       [ / ]  scale -/+        , / .  yaw -/+              hold Shift for 5x steps
+   The panel prints a ready-to-paste `splat: {...}` line as you go.
+
+   Most numbers can also be overridden from the address bar, which is handy on
+   the headset:  ?splat=work_1.spz&mesh=work_1.glb&sp=0,-0.1,0&ss=1.03&splats=400000
+   ============================================================================ */
+const Q = new URLSearchParams(location.search);
+const qNum = (key, fallback) => { const v = parseFloat(Q.get(key)); return Number.isFinite(v) ? v : fallback; };
+const qVec = (key, fallback) => { const v = (Q.get(key) ?? '').split(',').map(Number); return v.length === 3 && v.every(Number.isFinite) ? v : fallback; };
+const IS_HEADSET = /OculusBrowser|Quest|Pico|VisionOS/i.test(navigator.userAgent);
+
+const CONFIG = {
+
+  /* ---- Files (same folder as this page). ?splat= and ?mesh= override them. ---- */
+  files: {
+    splat:    Q.get('splat') || './myscan.spz',
+    collider: Q.get('mesh')  || './myscan.glb'
+  },
+
+  /* ---- WORLD: applied to both scans at once ----
+     Use this if the whole scan is rotated, mirrored or the wrong size.
+     Some capture tools export Y-down; for those set rotationDeg to [180, 0, 0]. */
+  world: {
+    position:    [0, 0, 0],
+    rotationDeg: [0, 0, 0],
+    scale:       1,            // keep at 1 for true 1:1 metric scale
+    floorToZero: true          // find the floor in the collision mesh and slide everything so it lands on Y = 0
+  },
+
+  /* ---- SPLAT ONLY: fine alignment of the picture against the collision mesh ----
+     ?sp=x,y,z   ?sr=x,y,z   ?ss=scale */
+  splat: {
+    position:    qVec('sp', [0, 0, 0]),
+    rotationDeg: qVec('sr', [0, 0, 0]),
+    scale:       qNum('ss', 1),
+    matchFloorToCollider: Q.get('floorfix') !== '0',  // auto-slide the splat vertically so its floor meets the collider's floor
+                                                      // (applied on top of position; set false once you have hand-tuned values)
+    /* Performance budget. The native three.js splat renderer has no level-of-detail,
+       so every splat is drawn for both eyes. Trim here if the headset stutters. */
+    maxSplats:  qNum('splats', IS_HEADSET ? 600000 : 0),   // 0 = keep everything. Lowest-impact splats go first.
+    maxSH:      qNum('sh', IS_HEADSET ? 0 : 3),            // 0..3 view-dependent colour bands. 0 is by far the cheapest.
+    minOpacity: 0.03,                                      // drop near-invisible splats
+    cropMargin: 1.0                                        // drop splats further than this outside the collider's bounding box (null = keep all)
+  },
+
+  /* ---- COLLIDER ONLY: the hidden physics mesh ---- */
+  collider: {
+    position:    [0, 0, 0],
+    rotationDeg: [0, 0, 0],
+    scale:       1,
+    addFloorPlane:  true,      // solid plane at floor height. Scanned floors have holes; this is what stops you falling through them
+    boundaryMargin: 0.6,       // invisible walls this far outside the mesh bounds, in case a scanned wall has gaps (null = none)
+    showAtStart:    Q.get('debug') === '1'
+  },
+
+  /* ---- Player ---- */
+  player: {
+    start: 'auto',             // 'auto' picks the roomiest spot on the floor, or give { x: 0, z: 0, yawDeg: 0 }
+    height: 1.6,               // collision capsule height. Your real head height is used for the view in VR
+    radius: 0.2,               // how close you can get to walls and furniture
+    eyeHeight: 1.6,            // desktop preview only
+    walkSpeed: 1.4,            // m/s, thumbstick and keyboard
+    snapTurnDeg: 30,
+    stepHeight: 0.25,          // tallest ledge you step onto automatically
+    mass: 70,                  // how hard you shove loose objects
+    pushBackFromWalls: true    // walking into a scanned wall in real life slides the world instead of letting your head through
+  },
+
+  /* ---- The three loose objects ---- */
+  props: {
+    items: [
+      { shape: 'box',    size: 0.14, color: 0xe2574c },
+      { shape: 'sphere', size: 0.16, color: 0x4c8fe2 },    // size = diameter
+      { shape: 'box',    size: 0.11, color: 0xf0b63f }
+    ],
+    height:   1.0,             // hand level above the floor
+    distance: 0.55,            // in front of the player
+    spacing:  0.26,            // gap between them, left to right
+    startParked: true,         // hover in place until grabbed or bumped; false = drop immediately
+    density: 400, friction: 0.8, restitution: 0.25
+  },
+
+  /* ---- Grabbing ---- */
+  grab: {
+    nearRadius: 0.10,          // controller within this distance of an object's surface = grab it directly
+    rayLength:  3.0,           // otherwise grab what the controller points at, up to this far (0 = touch only)
+    throwBoost: 1.15,          // multiplier on release velocity
+    maxThrowSpeed: 12,
+    handRadius: 0.045,         // invisible ball on each hand that knocks objects about
+    desktopToss: 2.5
+  },
+
+  /* ---- Headset rendering ---- */
+  xr: {
+    framebufferScale: qNum('res', 1.0),  // 0.7–0.9 buys frame rate at the cost of sharpness
+    foveation: 1,                        // 0..1 fixed foveated rendering (WebGL path)
+    multiview: false                     // experimental in three r186; leave off unless you have tested it with splats
+  },
+
+  physics: { gravity: 9.81 },
+  render:  { background: 0x0c1014, maxPixelRatio: 1.5, fov: 70 }
+};
+
+/* ============================================================================
+   1. RENDERER, SCENE, USER RIG
+   ============================================================================ */
+const $ = (id) => document.getElementById(id);
+const setStatus = (msg, isError = false) => { const el = $('status'); el.textContent = msg; el.classList.toggle('error', isError); if (isError) console.error(msg); };
+window.addEventListener('unhandledrejection', (e) => setStatus('Something failed: ' + (e.reason?.message ?? e.reason), true));
+
+// Splat colours are stored display-ready (sRGB) and are meant to be blended that way,
+// so the working colour space is switched to sRGB, exactly as the official three.js splat example does.
+// Side benefit: with no tone mapping, the renderer draws straight into the headset's framebuffer with no extra pass.
+THREE.ColorManagement.workingColorSpace = THREE.SRGBColorSpace;
+
+/* Backend choice. GaussianSplat needs WebGPURenderer, which has two backends:
+     - WebGPU: splats are sorted on the GPU (compute shader). In VR this needs the browser's
+       WebXR/WebGPU binding (XRGPUBinding). On Quest that is still behind
+       chrome://flags → "WebXR experimental features".
+     - WebGL 2: works in every WebXR browser today; splats are sorted on the CPU.
+   We pick WebGPU whenever it can actually present to the headset, WebGL 2 otherwise.
+   Force either one with ?backend=webgpu or ?backend=webgl. */
+const withTimeout = (promise, ms, fallback) => Promise.race([promise, new Promise((r) => setTimeout(() => r(fallback), ms))]);
+const xrSupported = !!navigator.xr && await withTimeout(navigator.xr.isSessionSupported('immersive-vr').catch(() => false), 2000, false);
+const xrGpuBinding = 'gpu' in navigator && typeof globalThis.XRGPUBinding !== 'undefined';
+const backendPref = Q.get('backend');
+const forceWebGL = backendPref === 'webgl' || (backendPref !== 'webgpu' && xrSupported && !xrGpuBinding);
+
+const renderer = new THREE.WebGPURenderer({
+  antialias: false,                         // MSAA does nothing for splats and costs a lot
+  forceWebGL,
+  multiview: CONFIG.xr.multiview,
+  outputBufferType: THREE.UnsignedByteType
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, CONFIG.render.maxPixelRatio));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setFramebufferScaleFactor(CONFIG.xr.framebufferScale);
+renderer.xr.setFoveation(CONFIG.xr.foveation);
+document.body.appendChild(renderer.domElement);
+await renderer.init();
+const ON_WEBGPU = renderer.backend.isWebGPUBackend === true;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(CONFIG.render.background);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f98, 2.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(1.5, 4, 2);
+scene.add(sun);
+
+/* userRig is the player's "play space". Its origin is a point on the virtual floor;
+   the camera and both controllers are children, so moving or turning the rig
+   moves the whole person. Nothing in here is ever scaled, which keeps 1 unit = 1 metre. */
+const userRig = new THREE.Group();
+userRig.name = 'userRig';
+scene.add(userRig);
+
+const camera = new THREE.PerspectiveCamera(CONFIG.render.fov, window.innerWidth / window.innerHeight, 0.05, 200);
+camera.position.set(0, CONFIG.player.eyeHeight, 0);
+camera.rotation.order = 'YXZ';
+userRig.add(camera);
+
+window.addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Start drawing right away so loading progress is visible; game logic waits for `ready`.
+// (These three are declared before the loop starts because frame() runs while the scans are still loading.)
+let ready = false, lastTime = 0, clock = 0;
+renderer.setAnimationLoop(frame);
+
+/* ============================================================================
+   2. LOAD THE SCANS AND LINE THEM UP
+   ============================================================================ */
+const DEG = Math.PI / 180;
+const applyTransform = (object, t) => {
+  object.position.fromArray(t.position);
+  object.rotation.set(t.rotationDeg[0] * DEG, t.rotationDeg[1] * DEG, t.rotationDeg[2] * DEG);
+  object.scale.setScalar(t.scale);
+};
+
+const scanRoot = new THREE.Group();       scanRoot.name = 'scanRoot';
+const splatPivot = new THREE.Group();     splatPivot.name = 'splatPivot';
+const colliderPivot = new THREE.Group();  colliderPivot.name = 'colliderPivot';
+applyTransform(scanRoot, CONFIG.world);
+applyTransform(splatPivot, CONFIG.splat);
+applyTransform(colliderPivot, CONFIG.collider);
+scanRoot.add(splatPivot, colliderPivot);
+scene.add(scanRoot);
+colliderPivot.visible = false;            // the physics mesh is never drawn (M / X shows it as a debug wireframe)
+
+const loadNote = (what, url, err) => `Could not load ${what} "${url}" (${err?.message ?? err}). Is the file next to this page? You can point at other names with ?splat=…&mesh=…`;
+
+setStatus('Loading the scan…');
+let splatProgress = 0;
+const [gltfResult, splatResult] = await Promise.allSettled([
+  new GLTFLoader().loadAsync(CONFIG.files.collider),
+  new SPZLoader().loadAsync(CONFIG.files.splat, (e) => {
+    if (!e.total) return;
+    const pct = Math.round(100 * e.loaded / e.total);
+    if (pct !== splatProgress) { splatProgress = pct; setStatus(`Loading the scan… ${pct}%`); }
+  })
+]);
+const notes = [];
+
+/* ---- 2a. Collision mesh → world-space triangles -------------------------------- */
+let tri = { vertices: new Float32Array(0), indices: new Uint32Array(0) };
+if (gltfResult.status === 'fulfilled') {
+  const model = gltfResult.value.scene;
+  const wire = new THREE.MeshBasicMaterial({ color: 0x7fe3c4, wireframe: true, transparent: true, opacity: 0.55, depthTest: false });
+  model.traverse((o) => {
+    if (!o.isMesh) return;
+    for (const m of [].concat(o.material)) {            // textures are never needed; free them
+      for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) {
+        const tex = m[key]; if (tex) { tex.source?.data?.close?.(); tex.dispose(); }
+      }
+      m.dispose();
+    }
+    o.material = wire;
+    o.renderOrder = 999;                                // debug wireframe draws over the splat
+  });
+  colliderPivot.add(model);
+  tri = bakeTriangles(colliderPivot);
+} else {
+  notes.push(loadNote('the collision mesh', CONFIG.files.collider, gltfResult.reason));
+}
+
+function bakeTriangles(root) {
+  scanRoot.updateMatrixWorld(true);
+  const vChunks = [], iChunks = [];
+  let vTotal = 0, iTotal = 0;
+  const v = new THREE.Vector3();
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.getAttribute('position');
+    if (!pos) return;
+    const verts = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      verts[i * 3] = v.x; verts[i * 3 + 1] = v.y; verts[i * 3 + 2] = v.z;
+    }
+    const index = o.geometry.index;
+    const n = index ? index.count : pos.count;
+    const inds = new Uint32Array(n - (n % 3));
+    for (let i = 0; i < inds.length; i++) inds[i] = (index ? index.getX(i) : i) + vTotal;
+    vChunks.push(verts); iChunks.push(inds);
+    vTotal += pos.count; iTotal += inds.length;
+  });
+  const vertices = new Float32Array(vTotal * 3), indices = new Uint32Array(iTotal);
+  let vo = 0, io = 0;
+  for (const c of vChunks) { vertices.set(c, vo); vo += c.length; }
+  for (const c of iChunks) { indices.set(c, io); io += c.length; }
+  return { vertices, indices };
+}
+
+/* ---- 2b. Find the floor: the largest flat, upward-facing area in the lower part of the mesh ---- */
+function findFloorY({ vertices, indices }) {
+  if (indices.length === 0) return 0;
+  let minY = Infinity, maxY = -Infinity;
+  for (let i = 1; i < vertices.length; i += 3) { minY = Math.min(minY, vertices[i]); maxY = Math.max(maxY, vertices[i]); }
+  const BIN = 0.04, bins = new Float32Array(Math.ceil((maxY - minY) / BIN) + 2);
+  const upTris = [];                                    // [centreY, area] pairs for the refinement pass
+  for (let t = 0; t < indices.length; t += 3) {
+    const a = indices[t] * 3, b = indices[t + 1] * 3, c = indices[t + 2] * 3;
+    const abx = vertices[b] - vertices[a], aby = vertices[b + 1] - vertices[a + 1], abz = vertices[b + 2] - vertices[a + 2];
+    const acx = vertices[c] - vertices[a], acy = vertices[c + 1] - vertices[a + 1], acz = vertices[c + 2] - vertices[a + 2];
+    const nx = aby * acz - abz * acy, ny = abz * acx - abx * acz, nz = abx * acy - aby * acx;
+    const len = Math.hypot(nx, ny, nz);
+    if (len < 1e-10 || ny / len < 0.8) continue;
+    const cy = (vertices[a + 1] + vertices[b + 1] + vertices[c + 1]) / 3;
+    bins[Math.floor((cy - minY) / BIN)] += len / 2;
+    upTris.push(cy, len / 2);
+  }
+  const low = Math.max(3, Math.floor(bins.length * 0.35));
+  let best = -1, bestArea = 0;
+  for (let i = 0; i < low; i++) {
+    const area = bins[i] + (bins[i - 1] || 0) + (bins[i + 1] || 0);
+    if (area > bestArea) { bestArea = area; best = i; }
+  }
+  if (best < 0 || bestArea < 0.05) return minY;
+  const centre = minY + (best + 0.5) * BIN;
+  let sum = 0, weight = 0;
+  for (let i = 0; i < upTris.length; i += 2) if (Math.abs(upTris[i] - centre) < 0.06) { sum += upTris[i] * upTris[i + 1]; weight += upTris[i + 1]; }
+  return weight > 0 ? sum / weight : centre;
+}
+
+let floorY = findFloorY(tri);
+if (CONFIG.world.floorToZero && tri.indices.length) {   // slide the whole scan so the floor is the Y = 0 plane
+  scanRoot.position.y -= floorY;
+  for (let i = 1; i < tri.vertices.length; i += 3) tri.vertices[i] -= floorY;
+  floorY = 0;
+}
+scanRoot.updateMatrixWorld(true);
+
+const bounds = new THREE.Box3();
+if (tri.vertices.length) bounds.setFromArray(tri.vertices);
+else bounds.set(new THREE.Vector3(-3, floorY, -3), new THREE.Vector3(3, floorY + 2.5, 3));
+
+/* ---- 2c. The splat ------------------------------------------------------------- */
+let splat = null;
+if (splatResult.status === 'fulfilled') {
+  setStatus('Preparing the splat…');
+  await new Promise((r) => setTimeout(r, 0));           // let the status paint before the heavy loop
+  const source = splatResult.value;
+  const total = source.getAttribute('position').count;
+
+  if (CONFIG.splat.matchFloorToCollider && tri.indices.length) {
+    const lift = measureSplatFloorOffset(source);
+    if (lift !== null && Math.abs(lift) > 0.005) {
+      // convert a world-space vertical shift into splatPivot's parent (scanRoot) space
+      const shift = new THREE.Vector3(0, lift, 0)
+        .applyQuaternion(scanRoot.getWorldQuaternion(new THREE.Quaternion()).invert())
+        .divideScalar(scanRoot.getWorldScale(new THREE.Vector3()).y);
+      splatPivot.position.add(shift);
+      scanRoot.updateMatrixWorld(true);
+      notes.push(`The splat's floor sat ${Math.abs(lift * 100).toFixed(1)} cm ${lift < 0 ? 'above' : 'below'} the collision mesh's floor, so the splat was shifted to match.`);
+    }
+  }
+
+  const geometry = trimSplatGeometry(source);
+  const kept = geometry.getAttribute('position').count;
+  splat = new GaussianSplat(geometry);                  // sorts itself back-to-front every frame (GPU compute on WebGPU, CPU on WebGL 2)
+  splat.name = 'scanSplat';
+  splatPivot.add(splat);
+  notes.push(kept === total ? `${total.toLocaleString()} splats.` : `Showing ${kept.toLocaleString()} of ${total.toLocaleString()} splats.`);
+} else {
+  notes.push(loadNote('the splat', CONFIG.files.splat, splatResult.reason));
+  colliderPivot.visible = true;                         // nothing to look at otherwise
+}
+
+/* How far is the splat's floor from the collider's floor? Looks for the densest
+   horizontal layer of solid splats within 40 cm of the collider's floor height. */
+function measureSplatFloorOffset(geometry) {
+  const pos = geometry.getAttribute('position').array, col = geometry.getAttribute('color').array;
+  const m = splatPivot.matrixWorld.elements, n = pos.length / 3;
+  const RANGE = 0.4, BIN = 0.02, bins = new Float32Array(Math.round(2 * RANGE / BIN));
+  const sums = new Float64Array(bins.length);
+  let counted = 0;
+  for (let i = 0; i < n; i++) {
+    if (col[i * 4 + 3] < 128) continue;
+    const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+    const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+    const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+    if (wx < bounds.min.x || wx > bounds.max.x || wz < bounds.min.z || wz > bounds.max.z) continue;
+    counted++;
+    const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const b = Math.floor((wy - floorY + RANGE) / BIN);
+    if (b >= 0 && b < bins.length) { bins[b]++; sums[b] += wy; }
+  }
+  let best = -1, bestCount = 0;
+  for (let i = 1; i < bins.length - 1; i++) {
+    const c = bins[i - 1] + bins[i] + bins[i + 1];
+    if (c > bestCount) { bestCount = c; best = i; }
+  }
+  if (best < 0 || bestCount < counted * 0.03) return null;   // no clear floor layer; leave the splat alone
+  let sum = 0, count = 0;
+  for (let i = Math.max(0, best - 2); i <= Math.min(bins.length - 1, best + 2); i++) { sum += sums[i]; count += bins[i]; }
+  return floorY - sum / count;
+}
+
+/* Crop far-away floaters, drop near-invisible splats, cap the count and the SH bands.
+   Returns a new geometry in the same layout SPZLoader produced. */
+function trimSplatGeometry(source) {
+  const S = CONFIG.splat;
+  const pos = source.getAttribute('position').array, col = source.getAttribute('color').array, cov = source.getAttribute('covariance').array;
+  const n = pos.length / 3, m = splatPivot.matrixWorld.elements;
+  const crop = S.cropMargin === null || !tri.indices.length ? null : bounds.clone().expandByScalar(S.cropMargin);
+  const minAlpha = Math.round(S.minOpacity * 255);
+  const score = new Float32Array(n);                     // 0 = rejected; otherwise opacity x size
+  let kept = 0;
+  for (let i = 0; i < n; i++) {
+    const alpha = col[i * 4 + 3];
+    if (alpha < minAlpha) continue;
+    if (crop) {
+      const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+      const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+      const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+      const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+      if (wx < crop.min.x || wx > crop.max.x || wy < crop.min.y || wy > crop.max.y || wz < crop.min.z || wz > crop.max.z) continue;
+    }
+    score[i] = (alpha / 255) * Math.sqrt(Math.max(cov[i * 6], cov[i * 6 + 3], cov[i * 6 + 5], 1e-12)) + 1e-9;
+    kept++;
+  }
+  let threshold = 0;
+  if (S.maxSplats > 0 && kept > S.maxSplats) {           // keep the big, solid splats; let the faint specks go
+    const sorted = score.filter((s) => s > 0).sort();
+    threshold = sorted[sorted.length - S.maxSplats];
+    kept = 0;
+    for (let i = 0; i < n; i++) if (score[i] >= threshold && score[i] > 0) kept++;
+  }
+  const out = new THREE.BufferGeometry();
+  const maxSH = Math.max(0, Math.min(3, Math.round(S.maxSH)));
+  for (const [name, attr] of Object.entries(source.attributes)) {
+    const band = /^sphericalHarmonics(\d)$/.exec(name);
+    if (band && Number(band[1]) > maxSH) continue;
+    const size = attr.itemSize, src = attr.array, dst = new src.constructor(kept * size);
+    let o = 0;
+    for (let i = 0; i < n; i++) {
+      if (score[i] === 0 || score[i] < threshold) continue;
+      for (let k = 0; k < size; k++) dst[o++] = src[i * size + k];
+    }
+    out.setAttribute(name, new THREE.BufferAttribute(dst, size, attr.normalized));
+  }
+  out.computeBoundingBox();
+  out.computeBoundingSphere();
+  return out;
+}
+
+/* ============================================================================
+   3. PHYSICS WORLD (Rapier)
+   ============================================================================ */
+await RAPIER.init();
+const world = new RAPIER.World({ x: 0, y: -CONFIG.physics.gravity, z: 0 });
+
+// Collision groups: upper 16 bits = "I am", lower 16 bits = "I collide with".
+const G = { WORLD: 1, PLAYER: 2, PROP: 4, HAND: 8, HELD: 16 };
+const groups = (member, filter) => ((member << 16) | filter) >>> 0;
+const GROUPS = {
+  world:     groups(G.WORLD, G.PLAYER | G.PROP),
+  player:    groups(G.PLAYER, G.WORLD | G.PROP),
+  prop:      groups(G.PROP, G.WORLD | G.PLAYER | G.PROP | G.HAND | G.HELD),
+  held:      groups(G.HELD, G.PROP),                 // a held object still shoves other objects, but not you
+  hand:      groups(G.HAND, G.PROP),
+  queryWorld: groups(0xffff, G.WORLD)                // for ray / overlap tests against static geometry only
+};
+const IDENTITY = { x: 0, y: 0, z: 0, w: 1 };
+
+/* ---- 3a. Static world: the scan as one triangle-mesh collider ---- */
+if (tri.indices.length) {
+  world.createCollider(RAPIER.ColliderDesc.trimesh(tri.vertices, tri.indices).setCollisionGroups(GROUPS.world).setFriction(0.9));
+}
+if (CONFIG.collider.addFloorPlane || !tri.indices.length) {
+  world.createCollider(RAPIER.ColliderDesc.cuboid(200, 0.5, 200).setTranslation(0, floorY - 0.5, 0).setCollisionGroups(GROUPS.world).setFriction(0.9));
+}
+if (CONFIG.collider.boundaryMargin !== null) {
+  const b = bounds.clone().expandByScalar(CONFIG.collider.boundaryMargin);
+  const cx = (b.min.x + b.max.x) / 2, cz = (b.min.z + b.max.z) / 2, hx = (b.max.x - b.min.x) / 2, hz = (b.max.z - b.min.z) / 2;
+  const wall = (x, z, sx, sz) => world.createCollider(RAPIER.ColliderDesc.cuboid(sx, 10, sz).setTranslation(x, floorY + 10, z).setCollisionGroups(GROUPS.world));
+  wall(b.min.x - 0.25, cz, 0.25, hz + 0.5); wall(b.max.x + 0.25, cz, 0.25, hz + 0.5);
+  wall(cx, b.min.z - 0.25, hx + 0.5, 0.25); wall(cx, b.max.z + 0.25, hx + 0.5, 0.25);
+}
+world.timestep = 1 / 240;
+world.step();                                         // builds the acceleration structure so queries below work
+
+/* ---- 3b. Player: a kinematic capsule driven by Rapier's character controller ---- */
+const P = CONFIG.player;
+const CC_OFFSET = 0.02;                               // skin gap the controller keeps from surfaces
+const capsuleHalf = Math.max(0.01, P.height / 2 - P.radius);
+const start = findStart();
+const playerBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(start.x, floorY + P.height / 2 + CC_OFFSET, start.z));
+const playerCollider = world.createCollider(RAPIER.ColliderDesc.capsule(capsuleHalf, P.radius).setCollisionGroups(GROUPS.player), playerBody);
+const characterController = world.createCharacterController(CC_OFFSET);
+characterController.setUp({ x: 0, y: 1, z: 0 });
+characterController.enableAutostep(P.stepHeight, 0.15, false);
+characterController.enableSnapToGround(P.stepHeight);
+characterController.setMaxSlopeClimbAngle(50 * DEG);
+characterController.setMinSlopeSlideAngle(40 * DEG);
+characterController.setApplyImpulsesToDynamicBodies(true);   // walking into loose objects pushes them
+characterController.setCharacterMass(P.mass);
+const player = { x: start.x, y: floorY + P.height / 2 + CC_OFFSET, z: start.z, vy: 0, grounded: true };
+userRig.position.set(start.x, floorY, start.z);
+userRig.rotation.y = start.yaw;
+
+/* Where to stand: the open floor spot with the most elbow room, facing the longest clear view. */
+function findStart() {
+  if (P.start !== 'auto') return { x: P.start.x, z: P.start.z, yaw: (P.start.yawDeg ?? 0) * DEG };
+  const shape = new RAPIER.Capsule(capsuleHalf, P.radius + 0.08);
+  const cx = (bounds.min.x + bounds.max.x) / 2, cz = (bounds.min.z + bounds.max.z) / 2;
+  let best = null;
+  for (let x = bounds.min.x + 0.3; x <= bounds.max.x - 0.3; x += 0.15) {
+    for (let z = bounds.min.z + 0.3; z <= bounds.max.z - 0.3; z += 0.15) {
+      if (world.intersectionWithShape({ x, y: floorY + P.height / 2 + 0.15, z }, IDENTITY, shape, undefined, GROUPS.queryWorld)) continue;
+      let free = Infinity, farDist = -1, farX = 0, farZ = -1;
+      for (let k = 0; k < 16; k++) {
+        const a = k / 16 * Math.PI * 2, dx = Math.sin(a), dz = Math.cos(a);
+        const hit = world.castRay(new RAPIER.Ray({ x, y: floorY + 1.1, z }, { x: dx, y: 0, z: dz }), 4, true, undefined, GROUPS.queryWorld);
+        const d = hit ? hit.timeOfImpact : 4;
+        free = Math.min(free, d);
+        if (d > farDist) { farDist = d; farX = dx; farZ = dz; }
+      }
+      const score = Math.min(free, 1.2) - 0.1 * Math.hypot(x - cx, z - cz);
+      if (!best || score > best.score) best = { x, z, yaw: Math.atan2(-farX, -farZ), score };
+    }
+  }
+  return best ?? { x: cx, z: cz, yaw: 0 };
+}
+
+/* ---- 3c. The loose objects: dynamic rigid bodies with matching three.js meshes ---- */
+const props = [];
+for (const item of CONFIG.props.items) {
+  const isBox = item.shape === 'box', half = item.size / 2;
+  const mesh = new THREE.Mesh(
+    isBox ? new THREE.BoxGeometry(item.size, item.size, item.size) : new THREE.SphereGeometry(half, 32, 20),
+    new THREE.MeshStandardMaterial({ color: item.color, roughness: 0.45, metalness: 0.05 })
+  );
+  scene.add(mesh);
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setCcdEnabled(true).setLinearDamping(0.05).setAngularDamping(0.3));
+  const collider = world.createCollider(
+    (isBox ? RAPIER.ColliderDesc.cuboid(half, half, half) : RAPIER.ColliderDesc.ball(half))
+      .setDensity(CONFIG.props.density).setFriction(CONFIG.props.friction).setRestitution(CONFIG.props.restitution)
+      .setCollisionGroups(GROUPS.prop),
+    body
+  );
+  const prop = { mesh, body, collider, radius: isBox ? half * 1.2 : half, heldBy: null };
+  mesh.userData.prop = prop;
+  props.push(prop);
+}
+const propMeshes = props.map((p) => p.mesh);
+
+/* Line the objects up at hand level in front of a point, pulled closer if a wall or desk is in the way. */
+function placeProps(x, z, yaw, groundY) {
+  const fx = -Math.sin(yaw), fz = -Math.cos(yaw), rx = Math.cos(yaw), rz = -Math.sin(yaw);
+  props.forEach((prop, i) => {
+    if (prop.heldBy) return;
+    const side = (i - (props.length - 1) / 2) * CONFIG.props.spacing;
+    const probe = new RAPIER.Ball(prop.radius + 0.03);
+    const at = { x: 0, y: groundY + CONFIG.props.height, z: 0 };
+    for (let d = CONFIG.props.distance; d >= 0.25; d -= 0.1) {
+      at.x = x + fx * d + rx * side; at.z = z + fz * d + rz * side;
+      if (!world.intersectionWithShape(at, IDENTITY, probe, undefined, GROUPS.queryWorld)) break;
+    }
+    prop.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    prop.body.setTranslation(at, true);
+    prop.body.setRotation(IDENTITY, true);
+    prop.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    prop.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    if (CONFIG.props.startParked) prop.body.sleep();     // a sleeping body ignores gravity until something touches it
+    prop.mesh.position.set(at.x, at.y, at.z);
+    prop.mesh.quaternion.identity();
+  });
+}
+placeProps(start.x, start.z, start.yaw, floorY);
+
+/* ============================================================================
+   4. CONTROLLERS, HANDS AND GRABBING
+   ============================================================================
+   getController(i)      = "target ray" pose: where the controller points. Objects attach to this.
+   getControllerGrip(i)  = "grip" pose: where the hand holds it. Used for the model and for touch distance.
+   Trigger (select) and grip (squeeze) both grab; with hand tracking a pinch fires select. */
+const raycaster = new THREE.Raycaster();
+const grabbers = [];
+const controllerModelFactory = new XRControllerModelFactory();
+const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _v = new THREE.Vector3(), _dir = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
+
+function makeGrabber(holder, near) {
+  const handBody = near ? world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, -100, 0)) : null;
+  const handCollider = near ? world.createCollider(RAPIER.ColliderDesc.ball(CONFIG.grab.handRadius).setCollisionGroups(GROUPS.hand), handBody) : null;
+  const g = { holder, near, held: null, via: null, history: [], inputSource: null, handBody, handCollider, handPause: 0, hover: null };
+  grabbers.push(g);
+  return g;
+}
+
+for (let i = 0; i < 2; i++) {
+  const controller = renderer.xr.getController(i);
+  const grip = renderer.xr.getControllerGrip(i);
+  grip.add(controllerModelFactory.createControllerModel(grip));
+  const ray = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.3)]),
+    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.45 })
+  );
+  ray.visible = false;
+  controller.add(ray);
+  userRig.add(controller, grip);
+
+  const g = makeGrabber(controller, grip);
+  controller.addEventListener('connected', (e) => { g.inputSource = e.data; ray.visible = e.data.targetRayMode === 'tracked-pointer'; });
+  controller.addEventListener('disconnected', () => { release(g); g.inputSource = null; ray.visible = false; });
+  controller.addEventListener('selectstart',  () => tryGrab(g, 'select'));
+  controller.addEventListener('selectend',    () => release(g, 'select'));
+  controller.addEventListener('squeezestart', () => tryGrab(g, 'squeeze'));
+  controller.addEventListener('squeezeend',   () => release(g, 'squeeze'));
+}
+const desktopGrabber = makeGrabber(camera, null);
+
+/* The point on the hand used for touch distance. */
+function handPoint(g, target) {
+  const source = g.near && g.near.visible ? g.near : g.holder;
+  return source.getWorldPosition(target);
+}
+
+/* What would this hand grab right now? Touch wins; otherwise whatever it points at. */
+function findGrabTarget(g, useRay = true) {
+  let best = null, bestDistance = CONFIG.grab.nearRadius;
+  if (g.near) {
+    handPoint(g, _p);
+    for (const prop of props) {
+      if (prop.heldBy) continue;
+      const d = _p.distanceTo(prop.mesh.position) - prop.radius;
+      if (d < bestDistance) { best = prop; bestDistance = d; }
+    }
+  }
+  if (best || !useRay || CONFIG.grab.rayLength <= 0) return best;
+  if (g.near) {                                          // XR: ray along the controller's -Z
+    g.holder.getWorldPosition(raycaster.ray.origin);
+    raycaster.ray.direction.set(0, 0, -1).applyQuaternion(g.holder.getWorldQuaternion(_q)).normalize();
+  }                                                      // desktop: the ray was already set from the click
+  raycaster.near = 0; raycaster.far = CONFIG.grab.rayLength;
+  const hit = raycaster.intersectObjects(propMeshes.filter((m) => !m.userData.prop.heldBy), false)[0];   // never raycast the splat itself: that walks every splat on the CPU
+  if (!hit) return null;
+  const o = raycaster.ray.origin, d = raycaster.ray.direction;
+  const wall = world.castRay(new RAPIER.Ray({ x: o.x, y: o.y, z: o.z }, { x: d.x, y: d.y, z: d.z }), hit.distance, true, undefined, GROUPS.queryWorld);
+  return wall ? null : hit.object.userData.prop;         // no grabbing through walls
+}
+
+function tryGrab(g, via) {
+  if (!ready || g.held) return;
+  const prop = findGrabTarget(g);
+  if (!prop) return;
+  g.held = prop; g.via = via; g.history.length = 0;
+  prop.heldBy = g;
+  prop.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);   // physics now follows the hand instead of gravity
+  prop.collider.setCollisionGroups(GROUPS.held);
+  g.holder.attach(prop.mesh);                            // parent to the controller, keeping its current world pose
+  if (!g.near) prop.mesh.position.set(0.14, -0.12, -0.5);   // desktop: carry it in front of the view
+  g.handCollider?.setEnabled(false);
+  setHighlight(prop, false);
+  g.inputSource?.gamepad?.hapticActuators?.[0]?.pulse?.(0.6, 40);
+}
+
+function release(g, via) {
+  const prop = g.held;
+  if (!prop || (via && via !== g.via)) return;           // only the button that grabbed lets go
+  g.held = null; prop.heldBy = null;
+  scene.attach(prop.mesh);                               // back to world space, pose preserved
+  prop.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+  prop.collider.setCollisionGroups(GROUPS.prop);
+  prop.body.setTranslation(prop.mesh.position, true);
+  prop.body.setRotation(prop.mesh.quaternion, true);
+
+  // Throw: velocity of the object over the last ~0.1 s of hand motion (world space, so rig movement counts too).
+  const linear = new THREE.Vector3(), angular = new THREE.Vector3();
+  if (!g.near) {
+    camera.getWorldDirection(linear).multiplyScalar(CONFIG.grab.desktopToss);
+  } else if (g.history.length >= 2) {
+    const newest = g.history[g.history.length - 1];
+    let oldest = g.history[0];
+    for (const h of g.history) if (newest.t - h.t <= 0.1) { oldest = h; break; }
+    const dt = newest.t - oldest.t;
+    if (dt > 1e-3) {
+      linear.subVectors(newest.p, oldest.p).divideScalar(dt).multiplyScalar(CONFIG.grab.throwBoost).clampLength(0, CONFIG.grab.maxThrowSpeed);
+      _q.copy(oldest.q).invert().premultiply(newest.q);  // rotation from oldest to newest
+      if (_q.w < 0) _q.set(-_q.x, -_q.y, -_q.z, -_q.w);
+      const s = Math.hypot(_q.x, _q.y, _q.z);
+      if (s > 1e-5) angular.set(_q.x, _q.y, _q.z).multiplyScalar(2 * Math.atan2(s, _q.w) / (s * dt)).clampLength(0, 25);
+    }
+  }
+  prop.body.setLinvel(linear, true);
+  prop.body.setAngvel(angular, true);
+  g.handPause = 0.3;                                     // keep the hand's own collider out of the way while the object leaves
+}
+
+function setHighlight(prop, on) { prop.mesh.material.emissive.setHex(on ? 0x2a2a2a : 0x000000); }
+
+/* Per-frame: move held objects' bodies with the hand, record motion for throwing, update hand colliders and hover glow. */
+function updateGrabbers(dt, now) {
+  const inXR = renderer.xr.isPresenting;
+  for (const g of grabbers) {
+    if (g.held) {
+      const mesh = g.held.mesh;
+      mesh.getWorldPosition(_p); mesh.getWorldQuaternion(_q);
+      g.held.body.setNextKinematicTranslation(_p);
+      g.held.body.setNextKinematicRotation(_q);
+      g.history.push({ t: now, p: _p.clone(), q: _q.clone() });
+      if (g.history.length > 12) g.history.shift();
+    }
+    if (g.handBody) {
+      g.handPause = Math.max(0, g.handPause - dt);
+      const active = inXR && !g.held && g.handPause === 0 && (g.near.visible || g.holder.visible);
+      if (g.handCollider.isEnabled() !== active) g.handCollider.setEnabled(active);
+      if (active) g.handBody.setNextKinematicTranslation(handPoint(g, _p));
+    }
+    if (g.near) {                                        // hover glow on whatever a trigger pull would grab
+      const target = inXR && !g.held ? findGrabTarget(g) : null;
+      if (target !== g.hover) {
+        if (g.hover && !grabbers.some((o) => o !== g && o.hover === g.hover)) setHighlight(g.hover, false);
+        if (target) setHighlight(target, true);
+        g.hover = target;
+      }
+    }
+  }
+}
+
+/* ============================================================================
+   5. INPUT: thumbsticks in VR, mouse and keys on desktop
+   ============================================================================
+   Left stick walks (relative to where you look). Right stick snap-turns.
+   A (right) brings the objects back in front of you. X (left) toggles the collision wireframe. */
+const keys = new Set();
+const input = { moveX: 0, moveZ: 0, snapArmed: true, buttonWas: { reset: false, debug: false } };
+let pitch = -0.45, dragging = false, dragMoved = 0;     // desktop preview starts looking slightly down, at the objects
+camera.rotation.set(pitch, 0, 0);
+
+window.addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (e.code === 'KeyR') resetProps();
+  if (e.code === 'KeyM') toggleColliderView();
+  if (e.code === 'KeyH') $('hud').hidden = !$('hud').hidden;
+  tuneKey(e);
+});
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => keys.clear());
+
+const canvas = renderer.domElement;
+canvas.addEventListener('pointerdown', (e) => { dragging = true; dragMoved = 0; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', (e) => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  dragMoved += Math.abs(e.movementX) + Math.abs(e.movementY);
+  userRig.rotation.y -= e.movementX * 0.0032;
+  pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0032, -1.4, 1.4);
+  camera.rotation.set(pitch, 0, 0);
+});
+canvas.addEventListener('pointerup', (e) => {
+  dragging = false;
+  if (dragMoved > 5 || renderer.xr.isPresenting || !ready) return;       // it was a look-drag, not a click
+  if (desktopGrabber.held) { release(desktopGrabber); return; }
+  raycaster.setFromCamera(new THREE.Vector2(e.clientX / window.innerWidth * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1), camera);
+  tryGrab(desktopGrabber, 'click');
+});
+
+function readInput() {
+  input.moveX = 0; input.moveZ = 0;
+  let turn = 0, reset = false, debug = false;
+  const session = renderer.xr.getSession();
+  if (session) {
+    for (const source of session.inputSources) {
+      const pad = source.gamepad;
+      if (!pad || pad.mapping !== 'xr-standard') continue;
+      const x = pad.axes[2] ?? 0, y = pad.axes[3] ?? 0;                   // thumbstick
+      if (source.handedness === 'left') {
+        if (Math.hypot(x, y) > 0.15) { input.moveX = x; input.moveZ = y; }
+        debug = debug || !!pad.buttons[4]?.pressed;                       // X
+      } else if (source.handedness === 'right') {
+        turn = x;
+        reset = reset || !!pad.buttons[4]?.pressed;                       // A
+      }
+    }
+  } else {
+    input.moveX = (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+    input.moveZ = (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0) - (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0);
+  }
+  if (Math.abs(turn) > 0.6 && input.snapArmed) { snapTurn(-Math.sign(turn) * P.snapTurnDeg * DEG); input.snapArmed = false; }
+  if (Math.abs(turn) < 0.3) input.snapArmed = true;
+  if (reset && !input.buttonWas.reset) resetProps();
+  if (debug && !input.buttonWas.debug) toggleColliderView();
+  input.buttonWas.reset = reset; input.buttonWas.debug = debug;
+}
+
+/* Head position in world space, on the floor plane (camera.position is the head pose inside the rig). */
+function headXZ(target) {
+  target.set(camera.position.x, 0, camera.position.z).applyAxisAngle(UP, userRig.rotation.y);
+  target.x += userRig.position.x; target.z += userRig.position.z;
+  return target;
+}
+
+function snapTurn(angle) {                               // rotate the rig around the head, not around the room's centre
+  const before = headXZ(new THREE.Vector3());
+  userRig.rotation.y += angle;
+  const after = headXZ(new THREE.Vector3());
+  userRig.position.x += before.x - after.x; userRig.position.z += before.z - after.z;
+}
+
+function resetProps() {
+  if (!ready) return;
+  const head = headXZ(new THREE.Vector3());
+  camera.getWorldDirection(_dir);
+  placeProps(head.x, head.z, Math.atan2(-_dir.x, -_dir.z), userRig.position.y);
+}
+
+/* ============================================================================
+   6. PLAYER MOVEMENT: capsule vs. scan, then the rig follows the capsule
+   ============================================================================ */
+const _head = new THREE.Vector3(), _desired = { x: 0, y: 0, z: 0 };
+
+function stepPlayer(dt) {
+  // Thumbstick / keyboard intent, relative to gaze direction.
+  camera.getWorldDirection(_dir); _dir.y = 0;
+  if (_dir.lengthSq() < 1e-6) _dir.set(0, 0, -1);
+  _dir.normalize();
+  const speed = P.walkSpeed * Math.min(1, Math.hypot(input.moveX, input.moveZ)) / Math.max(1e-6, Math.hypot(input.moveX, input.moveZ));
+  const stickX = (-_dir.z * input.moveX - _dir.x * input.moveZ) * speed * dt;
+  const stickZ = (_dir.x * input.moveX - _dir.z * input.moveZ) * speed * dt;
+
+  // Real walking: the capsule chases wherever the head has moved to inside the play space.
+  headXZ(_head);
+  player.vy = player.grounded ? 0 : Math.max(-30, player.vy - CONFIG.physics.gravity * dt);
+  _desired.x = stickX + (_head.x - player.x);
+  _desired.z = stickZ + (_head.z - player.z);
+  _desired.y = player.vy * dt - 0.002;                   // tiny downward bias keeps ground contact
+
+  characterController.computeColliderMovement(playerCollider, _desired, undefined, GROUPS.player);
+  const moved = characterController.computedMovement();
+  player.grounded = characterController.computedGrounded();
+  player.x += moved.x; player.y += moved.y; player.z += moved.z;
+  if (player.y < floorY - 5) { player.x = start.x; player.y = floorY + P.height / 2 + 0.3; player.z = start.z; player.vy = 0; }   // safety net
+  playerBody.setNextKinematicTranslation(player);
+
+  // Move the rig so the head stays over the capsule. If a wall stopped the capsule, this is what stops you.
+  if (P.pushBackFromWalls || renderer.xr.isPresenting === false) {
+    userRig.position.x += player.x - _head.x;
+    userRig.position.z += player.z - _head.z;
+  } else {
+    userRig.position.x += stickX; userRig.position.z += stickZ;
+  }
+  const feet = player.y - P.height / 2 - CC_OFFSET;
+  userRig.position.y += (feet - userRig.position.y) * Math.min(1, dt * 12);   // eased, so bumpy scan floors don't jitter the view
+}
+
+/* ---- Entering / leaving VR ---- */
+let recenterFrames = 0;
+renderer.xr.addEventListener('sessionstart', () => {
+  $('hud').style.display = 'none';
+  recenterFrames = 3;                                    // wait for a real head pose, then put the head on the start spot
+});
+renderer.xr.addEventListener('sessionend', () => {
+  $('hud').style.display = '';
+  for (const g of grabbers) if (g.near) release(g);
+  camera.position.set(0, P.eyeHeight, 0);
+  camera.rotation.set(pitch, 0, 0);
+  camera.fov = CONFIG.render.fov; camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function recenterOnStart() {
+  // Turn the rig so the way you are looking becomes the start direction, then slide it so your head is on the start spot.
+  camera.getWorldDirection(_dir);
+  const gazeYaw = Math.atan2(-_dir.x, -_dir.z);
+  userRig.rotation.y += start.yaw - gazeYaw;
+  headXZ(_head);
+  userRig.position.x += start.x - _head.x; userRig.position.z += start.z - _head.z;
+  userRig.position.y = floorY;
+  player.x = start.x; player.z = start.z; player.y = floorY + P.height / 2 + CC_OFFSET; player.vy = 0;
+  playerBody.setTranslation(player, true);
+  if (props.every((p) => !p.heldBy)) placeProps(start.x, start.z, start.yaw, floorY);
+}
+
+/* ============================================================================
+   7. FRAME LOOP
+   ============================================================================ */
+function frame(time) {
+  const dt = Math.min(0.05, Math.max(1 / 240, (time - lastTime) / 1000 || 1 / 72));
+  lastTime = time; clock += dt;
+  if (ready) {
+    if (recenterFrames > 0 && renderer.xr.isPresenting && --recenterFrames === 0) recenterOnStart();
+    readInput();
+    stepPlayer(dt);
+    updateGrabbers(dt, clock);
+    world.timestep = dt;
+    world.step();
+    for (const prop of props) {                          // physics → visuals for everything not in a hand
+      if (prop.heldBy) continue;
+      const t = prop.body.translation(), r = prop.body.rotation();
+      prop.mesh.position.set(t.x, t.y, t.z);
+      prop.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+      if (t.y < floorY - 10) resetProps();
+    }
+  }
+  renderer.render(scene, camera);
+}
+
+/* ============================================================================
+   8. DEBUG VIEW AND LIVE ALIGNMENT
+   ============================================================================ */
+function toggleColliderView() {
+  colliderPivot.visible = !colliderPivot.visible;
+  $('tune').hidden = !colliderPivot.visible;
+  printTune();
+}
+function printTune() {
+  const r = (n, d = 3) => +n.toFixed(d), p = splatPivot.position, e = splatPivot.rotation;
+  $('tune').textContent =
+    'Nudge the splat: I/K up-down  J/L x  U/O z  [ ] scale  , . yaw  (Shift = 5x)\n' +
+    `splat: { position: [${r(p.x)}, ${r(p.y)}, ${r(p.z)}], rotationDeg: [${r(e.x / DEG, 2)}, ${r(e.y / DEG, 2)}, ${r(e.z / DEG, 2)}], scale: ${r(splatPivot.scale.x, 4)}, matchFloorToCollider: false }`;
+}
+function tuneKey(e) {
+  if (!colliderPivot.visible || renderer.xr.isPresenting) return;
+  const k = e.shiftKey ? 5 : 1, step = 0.01 * k, p = splatPivot.position;
+  switch (e.code) {
+    case 'KeyI': p.y += step; break;            case 'KeyK': p.y -= step; break;
+    case 'KeyL': p.x += step; break;            case 'KeyJ': p.x -= step; break;
+    case 'KeyO': p.z += step; break;            case 'KeyU': p.z -= step; break;
+    case 'BracketRight': splatPivot.scale.multiplyScalar(1 + 0.005 * k); break;
+    case 'BracketLeft':  splatPivot.scale.multiplyScalar(1 / (1 + 0.005 * k)); break;
+    case 'Period': splatPivot.rotation.y += 0.25 * DEG * k; break;
+    case 'Comma':  splatPivot.rotation.y -= 0.25 * DEG * k; break;
+    default: return;
+  }
+  printTune();
+}
+if (CONFIG.collider.showAtStart) toggleColliderView();
+
+/* ============================================================================
+   9. VR BUTTON, READY
+   ============================================================================
+   The standard three.js VRButton, mounted in the centered #vr-ui container.
+   'webgpu' is only requested when the WebGPU backend is driving the headset. */
+const sessionInit = { optionalFeatures: ['hand-tracking', ...(ON_WEBGPU ? ['webgpu'] : [])] };
+const vrUI = $('vr-ui');
+vrUI.appendChild(VRButton.createButton(renderer, sessionInit));
+if (!xrSupported) vrUI.classList.add('docked');          // nothing to enter on this device: tuck the notice in the corner
+
+ready = true;
+const problems = [gltfResult, splatResult].some((r) => r.status === 'rejected');
+setStatus(
+  `${ON_WEBGPU ? 'WebGPU' : 'WebGL 2'} backend${xrSupported && !ON_WEBGPU && 'gpu' in navigator ? ' (VR over WebGPU is not switched on in this browser, so splats sort on the CPU)' : ''}. ` + notes.join(' '),
+  problems
+);
+
+// Handy from the console / remote inspector.
+window.app = { CONFIG, THREE, renderer, scene, userRig, camera, scanRoot, splatPivot, colliderPivot, splat, world, props, player, start, floorY, bounds, grabbers };
+</script>
+</body>
+</html>

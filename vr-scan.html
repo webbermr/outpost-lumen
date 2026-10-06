@@ -70,6 +70,7 @@
 <div id="hud">
   <h1>Scan walkthrough</h1>
   <p id="status">Starting up…</p>
+  <p id="view">View: Splat (M or X changes it)</p>
   <p id="help">In the headset: left stick walks, right stick turns, trigger or grip grabs and throws. A brings the objects back. X flips the view: splat, splat with the collision wireframe, mesh.</p>
   <p>Here: drag to look, W A S D to walk, click an object to pick it up and click again to toss it. R, M and H do the same as A, X and hide this panel.</p>
   <p id="tune" hidden></p>
@@ -297,6 +298,45 @@ colliderPivot.visible = false;            // the physics mesh starts hidden; M /
 const colliderMeshes = [];
 const VIEW = { SPLAT: 0, SPLAT_WIRE: 1, MESH: 2 };   // splat  →  splat + collision wireframe  →  textured mesh only
 let viewMode = VIEW.SPLAT;
+
+/* In-headset view indicator. The DOM panel is invisible in VR, so the name of the current
+   view is drawn onto a small canvas texture and shown in two places:
+     - viewToast: floats in front of your eyes for a moment whenever the view changes
+     - viewTag:   a small permanent tag riding on the left controller (next to the X button that changes it) */
+const VIEW_NAMES = ['Splat', 'Splat + wireframe', 'Mesh'];
+const viewCanvas = Object.assign(document.createElement('canvas'), { width: 512, height: 112 });
+const viewTexture = new THREE.CanvasTexture(viewCanvas);
+viewTexture.colorSpace = THREE.SRGBColorSpace;
+const makeViewLabel = (width) => {
+  const label = new THREE.Mesh(
+    new THREE.PlaneGeometry(width, width * viewCanvas.height / viewCanvas.width),
+    new THREE.MeshBasicMaterial({ map: viewTexture, transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide })
+  );
+  label.renderOrder = 1000;                              // after the splat and the wireframe, so it is never hidden
+  return label;
+};
+const viewToast = makeViewLabel(0.30);
+viewToast.position.set(0, -0.10, -0.8);                  // 80 cm ahead, just below eye line. Tweak here.
+viewToast.visible = false;
+camera.add(viewToast);
+const viewTag = makeViewLabel(0.085);
+viewTag.position.set(0, 0.055, 0.03);                    // sits just above the left controller, tilted up toward your face. Tweak here.
+viewTag.rotation.x = -Math.PI / 4;
+let viewToastTime = 0;
+
+function showViewLabel(seconds = 2.5) {
+  const ctx = viewCanvas.getContext('2d'), w = viewCanvas.width, h = viewCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(12, 16, 20, 0.82)';
+  ctx.beginPath(); ctx.roundRect(4, 4, w - 8, h - 8, 26); ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = '#7fe3c4'; ctx.stroke();
+  ctx.fillStyle = '#e9edf0'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '600 46px "Segoe UI", system-ui, sans-serif';
+  ctx.fillText('View: ' + VIEW_NAMES[viewMode], w / 2, h / 2 + 2);
+  viewTexture.needsUpdate = true;
+  viewToast.visible = true; viewToast.material.opacity = 1; viewToastTime = seconds;
+  $('view').textContent = `View: ${VIEW_NAMES[viewMode]} (M or X changes it)`;
+}
 
 const loadNote = (what, url, err) => `Could not load ${what} "${url}" (${err?.message ?? err}). Is the file next to this page? You can point at other names with ?splat=…&mesh=…`;
 
@@ -678,7 +718,10 @@ for (let i = 0; i < 2; i++) {
   userRig.add(controller, grip);
 
   const g = makeGrabber(controller, grip);
-  controller.addEventListener('connected', (e) => { g.inputSource = e.data; ray.visible = e.data.targetRayMode === 'tracked-pointer'; });
+  controller.addEventListener('connected', (e) => {
+    g.inputSource = e.data; ray.visible = e.data.targetRayMode === 'tracked-pointer';
+    if (e.data.handedness === 'left') grip.add(viewTag);       // the view tag rides on whichever grip is the left hand
+  });
   controller.addEventListener('disconnected', () => { release(g); g.inputSource = null; ray.visible = false; });
   controller.addEventListener('selectstart',  () => tryGrab(g, 'select'));
   controller.addEventListener('selectend',    () => release(g, 'select'));
@@ -925,6 +968,7 @@ let recenterFrames = 0;
 renderer.xr.addEventListener('sessionstart', () => {
   $('hud').style.display = 'none';
   recenterFrames = 3;                                    // wait for a real head pose, then put the head on the start spot
+  showViewLabel(4);                                      // say which view you are starting in
 });
 renderer.xr.addEventListener('sessionend', () => {
   $('hud').style.display = '';
@@ -970,6 +1014,11 @@ function frame(time) {
       if (t.y < floorY - 10) resetProps();
     }
   }
+  if (viewToast.visible) {                               // the toast holds, then fades over its last 0.4 s
+    viewToastTime -= dt;
+    viewToast.material.opacity = Math.min(1, Math.max(0, viewToastTime / 0.4));
+    if (viewToastTime <= 0) viewToast.visible = false;
+  }
   renderer.render(scene, camera);
 }
 
@@ -986,6 +1035,7 @@ function setViewMode(mode) {
   }
   $('tune').hidden = mode !== VIEW.SPLAT_WIRE;
   printTune();
+  showViewLabel();
 }
 function toggleColliderView() {                          // M on the keyboard, X on the left controller
   const order = splat ? [VIEW.SPLAT, VIEW.SPLAT_WIRE, VIEW.MESH] : [VIEW.MESH, VIEW.SPLAT_WIRE];
@@ -1033,7 +1083,7 @@ setStatus(
 );
 
 // Handy from the console / remote inspector.
-window.app = { CONFIG, THREE, renderer, scene, userRig, camera, scanRoot, splatPivot, colliderPivot, splat, world, props, player, start, floorY, bounds, grabbers };
+window.app = { viewToast, viewTag, CONFIG, THREE, renderer, scene, userRig, camera, scanRoot, splatPivot, colliderPivot, splat, world, props, player, start, floorY, bounds, grabbers };
 </script>
 </body>
 </html>

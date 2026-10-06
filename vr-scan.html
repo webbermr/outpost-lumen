@@ -144,7 +144,21 @@ const CONFIG = {
     maxSplats:  qNum('splats', IS_HEADSET ? 600000 : 0),   // 0 = keep everything. Lowest-impact splats go first.
     maxSH:      qNum('sh', IS_HEADSET ? 0 : 3),            // 0..3 view-dependent colour bands. 0 is by far the cheapest.
     minOpacity: 0.03,                                      // drop near-invisible splats
-    cropMargin: 1.0                                        // drop splats further than this outside the collider's bounding box (null = keep all)
+    cropMargin: 1.0,                                       // drop splats further than this outside the collider's bounding box (null = keep all)
+
+    /* Floater cleanup: removes the stray blobs that hang in mid-air.
+       ?clean=0 turns it off, ?clean=2 (or 3, 4…) makes it more aggressive,
+       ?clean=show draws ONLY what would be removed, so you can check nothing real is being thrown away. */
+    floaters: (() => {
+      const arg = Q.get('clean'), strength = arg === 'show' || arg === null ? 1 : Math.max(0, parseFloat(arg) || 0);
+      return {
+        enabled:      strength > 0,
+        showOnly:     arg === 'show',
+        minNeighbors: 25 * strength,     // a splat with fewer neighbours than this in the 30 cm cube around it is a loner: drop it
+        minCluster:   2000 * strength,   // a clump with fewer splats than this that touches nothing else is a floating island: drop it
+        maxSize:      0.15               // a single blob with a radius above this (metres) is haze, not surface: drop it
+      };
+    })()
   },
 
   /* ---- COLLIDER ONLY: the hidden physics mesh ---- */
@@ -451,7 +465,7 @@ if (tri.vertices.length) bounds.setFromArray(tri.vertices);
 else bounds.set(new THREE.Vector3(-3, floorY, -3), new THREE.Vector3(3, floorY + 2.5, 3));
 
 /* ---- 2c. The splat ------------------------------------------------------------- */
-let splat = null;
+let splat = null, floatersRemoved = 0;
 if (splatResult.status === 'fulfilled') {
   setStatus('Preparing the splat…');
   await new Promise((r) => setTimeout(r, 0));           // let the status paint before the heavy loop
@@ -477,6 +491,7 @@ if (splatResult.status === 'fulfilled') {
   splat.name = 'scanSplat';
   splatPivot.add(splat);
   notes.push(kept === total ? `${total.toLocaleString()} splats.` : `Showing ${kept.toLocaleString()} of ${total.toLocaleString()} splats.`);
+  if (floatersRemoved > 0) notes.push(CONFIG.splat.floaters.showOnly ? `Showing only the ${floatersRemoved.toLocaleString()} splats the cleanup would remove.` : `Cleaned up ${floatersRemoved.toLocaleString()} floating splats.`);
 } else {
   notes.push(loadNote('the splat', CONFIG.files.splat, splatResult.reason));
   setViewMode(VIEW.MESH);                               // nothing else to look at
@@ -512,6 +527,83 @@ function measureSplatFloorOffset(geometry) {
   return floorY - sum / count;
 }
 
+/* Find floaters among the splats still in play (score > 0). Three tests, cheapest first:
+     1. oversized blobs
+     2. loners: too few neighbours in the surrounding 3 x 3 x 3 block of 10 cm cells
+     3. islands: small clumps not connected (through touching 7 cm cells) to the main body of the scan
+   Returns a per-splat flag array. Works in world space, so CONFIG transforms are respected. */
+function findFloaters(pos, cov, score, n, m) {
+  const F = CONFIG.splat.floaters, flag = new Uint8Array(n);
+  if (!F.enabled) return { flag, count: 0 };
+  const scale = splatPivot.getWorldScale(new THREE.Vector3()).x;
+  const w = new Float32Array(n * 3);
+  let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity, count = 0;
+  for (let i = 0; i < n; i++) {
+    if (score[i] === 0) continue;
+    if (Math.sqrt(Math.max(cov[i * 6], cov[i * 6 + 3], cov[i * 6 + 5])) * scale > F.maxSize) { flag[i] = 1; count++; continue; }
+    const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
+    const wx = w[i * 3] = m[0] * x + m[4] * y + m[8] * z + m[12];
+    const wy = w[i * 3 + 1] = m[1] * x + m[5] * y + m[9] * z + m[13];
+    const wz = w[i * 3 + 2] = m[2] * x + m[6] * y + m[10] * z + m[14];
+    if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+    if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+    if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+  }
+  if (minX === Infinity) return { flag, count };
+
+  // Bin the remaining splats into a voxel grid with one empty cell of padding on every side.
+  const gridOf = (cell) => {
+    while ((maxX - minX) * (maxY - minY) * (maxZ - minZ) / cell ** 3 > 2e7) cell *= 1.5;    // keep huge scans within memory
+    const nx = Math.floor((maxX - minX) / cell) + 3, ny = Math.floor((maxY - minY) / cell) + 3, nz = Math.floor((maxZ - minZ) / cell) + 3;
+    const idx = new Int32Array(n).fill(-1), counts = new Int32Array(nx * ny * nz);
+    for (let i = 0; i < n; i++) {
+      if (score[i] === 0 || flag[i]) continue;
+      const c = (Math.floor((w[i * 3] - minX) / cell) + 1) + nx * ((Math.floor((w[i * 3 + 1] - minY) / cell) + 1) + ny * (Math.floor((w[i * 3 + 2] - minZ) / cell) + 1));
+      idx[i] = c; counts[c]++;
+    }
+    return { idx, counts, nx, ny, nz };
+  };
+
+  // 2. Loners. A 3 x 3 x 3 box sum, done as three one-axis passes.
+  {
+    const g = gridOf(0.10);
+    let a = g.counts, b = new Int32Array(a.length);
+    for (const stride of [1, g.nx, g.nx * g.ny]) {
+      for (let i = stride; i < a.length - stride; i++) b[i] = a[i - stride] + a[i] + a[i + stride];
+      [a, b] = [b, a];
+    }
+    for (let i = 0; i < n; i++) if (g.idx[i] >= 0 && a[g.idx[i]] < F.minNeighbors) { flag[i] = 1; count++; }
+  }
+
+  // 3. Islands. Flood-fill connected occupied cells; keep the biggest body and any clump large enough to be real.
+  {
+    const g = gridOf(0.07), { counts, nx, ny } = g;
+    const labels = new Int32Array(counts.length), stack = new Int32Array(counts.length), totals = [0];
+    const offsets = [];
+    for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (dx || dy || dz) offsets.push(dx + nx * (dy + ny * dz));
+    for (let c = 0; c < counts.length; c++) {
+      if (counts[c] === 0 || labels[c] !== 0) continue;
+      const id = totals.length;
+      let top = 0, total = 0;
+      stack[top++] = c; labels[c] = id;
+      while (top > 0) {
+        const cur = stack[--top];
+        total += counts[cur];
+        for (const o of offsets) { const nb = cur + o; if (counts[nb] > 0 && labels[nb] === 0) { labels[nb] = id; stack[top++] = nb; } }
+      }
+      totals.push(total);
+    }
+    let main = 0;
+    for (let id = 1; id < totals.length; id++) if (totals[id] > totals[main]) main = id;
+    for (let i = 0; i < n; i++) {
+      if (g.idx[i] < 0) continue;
+      const id = labels[g.idx[i]];
+      if (id !== main && totals[id] < F.minCluster) { flag[i] = 1; count++; }
+    }
+  }
+  return { flag, count };
+}
+
 /* Crop far-away floaters, drop near-invisible splats, cap the count and the SH bands.
    Returns a new geometry in the same layout SPZLoader produced. */
 function trimSplatGeometry(source) {
@@ -535,6 +627,15 @@ function trimSplatGeometry(source) {
     score[i] = (alpha / 255) * Math.sqrt(Math.max(cov[i * 6], cov[i * 6 + 3], cov[i * 6 + 5], 1e-12)) + 1e-9;
     kept++;
   }
+  const floaters = findFloaters(pos, cov, score, n, m);
+  if (floaters.count > 0) {
+    kept = 0;
+    for (let i = 0; i < n; i++) {
+      if (S.floaters.showOnly ? !floaters.flag[i] : floaters.flag[i]) score[i] = 0;
+      if (score[i] > 0) kept++;
+    }
+  }
+  floatersRemoved = floaters.count;
   let threshold = 0;
   if (S.maxSplats > 0 && kept > S.maxSplats) {           // keep the big, solid splats; let the faint specks go
     const sorted = score.filter((s) => s > 0).sort();
